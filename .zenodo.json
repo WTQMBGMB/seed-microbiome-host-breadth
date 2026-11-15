@@ -1,0 +1,52 @@
+{
+  "title": "Host-associated community structure and microbial host breadth in the seed microbiome: analysis code",
+  "upload_type": "software",
+  "version": "1.0.0",
+  "description": "Downstream analysis code for a cross-study synthesis of 5,962 marker-gene profiles from 169 plant species and 45 countries. The 16S reference-mapped set includes bacteria and archaea. Companion processed-input, precomputed-result and output archives are released separately. The workflow starts from processed tables and reuses archived computations; it does not reproduce raw-read processing or the historical modified iCAMP engine. Final manuscript artwork includes editorial changes beyond source plots.",
+  "creators": [
+    {
+      "name": "Wang, Zilong",
+      "affiliation": "Lanzhou University"
+    },
+    {
+      "name": "Ai, Wenfeng",
+      "affiliation": "Lanzhou University"
+    },
+    {
+      "name": "Li, Xiangyu",
+      "affiliation": "Lanzhou University"
+    },
+    {
+      "name": "Xu, Ying",
+      "affiliation": "Lanzhou University"
+    },
+    {
+      "name": "He, Peng",
+      "affiliation": "Lanzhou University"
+    },
+    {
+      "name": "Ma, Tengfei",
+      "affiliation": "Lanzhou University"
+    },
+    {
+      "name": "Ling, Ning",
+      "affiliation": "Lanzhou University; Nanjing Agricultural University"
+    }
+  ],
+  "license": "MIT",
+  "keywords": [
+    "seed microbiome",
+    "microbial ecology",
+    "host breadth",
+    "meta-analysis",
+    "reproducible research"
+  ],
+  "notes": "Original processed-data contributions use CC BY 4.0; third-party inputs retain their original terms.",
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/WTQMBGMB/seed-microbiome-host-breadth",
+      "relation": "isSupplementTo",
+      "scheme": "url"
+    }
+  ]
+}

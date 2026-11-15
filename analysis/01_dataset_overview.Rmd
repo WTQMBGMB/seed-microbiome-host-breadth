@@ -1,0 +1,242 @@
+```{r dataset-setup}
+# 载入配置与数据集展示工具 / Load configuration and dataset helpers.
+source(file.path(PROJECT_ROOT <- normalizePath(Sys.getenv("SEED_PROJECT_ROOT", unset = getwd()), winslash = "/"), "R", "config.R"))
+source(file.path(PROJECT_ROOT, "R", "io.R"))
+source(file.path(PROJECT_ROOT, "R", "preprocess.R"))
+suppressMessages({library(data.table); library(ggplot2); library(dplyr); library(cowplot)})
+
+PAL1 <- c("#3A5A40", "#F2CC8F", "#81B29A", "#3D405B", "#F4A261",
+          "#099396", "#E7D6C2", "#547FB6", "#C5D8E7", "#BF6173",
+          "#E07A5F", "#90DBF4", "#641E16", "#A7C957", "#D35400")
+PAL2 <- c("#855B67", "#B6BCCA", "#C1B5BF", "#FDE0E4", "#78A495", "#8A926B",
+          "#5D6C57", "#6E736D", "#E4E2C9", "#CFE1D3", "#995B70", "#846992",
+          "#D4C0C2", "#F7E09B", "#099396", "#E7D6C2", "#547FB6", "#C5D8E7",
+          "#BF6173", "#3A5A40", "#90DBF4", "#641E16", "#BFEFEE", "#D35400",
+          "#1D3557", "#F1C40F", "#5B2C6F", "#A7C957", "#E63946", "#355070",
+          "#F4A261", "#1E5959", "#CB997E", "#2A9D8F", "#FFE8D6", "#6D597A",
+          "#F9C74F", "#2E4053", "#A8DADC", "#BA4A00", "#7DCEA0", "#424949",
+          "#E5989B", "#E07A5F", "#F2CC8F", "#81B29A", "#3D405B", "#F4A261",
+          "#E76F51", "#2A9D8F", "#264653", "#F9C74F", "#A8DADC", "#E63946",
+          "#F1FAEE", "#457B9D", "#E0A458", "#6D597A", "#B5E8D5", "#FFBF69",
+          "#2EC4B6", "#1D3557", "#F6BD60", "#8AC6C3", "#E56B6F", "#4A6FA5",
+          "#F5E8C7", "#233D4D")
+REG_ORDER <- c("V3_V4", "V4", "V5_V6", "V5_V7", "ITS1", "ITS2")
+SRC_ORDER <- c("S1-53 Collected", "S54 Simonin2022", "S55 Lab(52spp)")
+TH <- theme_minimal(base_size = 11) + theme(panel.grid.minor = element_blank())
+```
+
+```{r dataset-metadata}
+# 合并 metadata 并统一来源、国家与样本类型 / Combine metadata and harmonize labels.
+m16 <- data.table::fread(file.path(DATA_DIR, "metadata", "metadata_16S.txt"))
+mits <- data.table::fread(file.path(DATA_DIR, "metadata", "metadata_ITS.txt"))
+md <- rbind(
+  m16[, .(SampleID, Genus, species, Country, Cite, extract, Region, bio_project, dataset = "16S")],
+  mits[, .(SampleID, Genus, species, Country, Cite, extract, Region, bio_project, dataset = "ITS")]
+)
+md[, region := factor(Region, levels = REG_ORDER)]
+md[, source := fifelse(Cite == "S54", SRC_ORDER[2],
+                fifelse(Cite == "S55", SRC_ORDER[3], SRC_ORDER[1]))]
+md[, source := factor(source, levels = SRC_ORDER)]
+CNTRY_FIX <- c("Cote d Ivoire" = "Côte d'Ivoire", "Italia" = "Italy",
+                "Korea" = "South Korea", "USA" = "United States of America",
+                "United States" = "United States of America", "Czech Republic" = "Czechia",
+                "England" = "United Kingdom", "Republic of the Congo" = "Congo",
+                "Democratic Republic of the Congo" = "Dem. Rep. Congo")
+md[, country_raw := Country]
+for (nm in names(CNTRY_FIX)) md[Country == nm, Country := CNTRY_FIX[[nm]]]
+md[is.na(Country) | Country == "", Country := "unknown"]
+md[, extract_std := fifelse(grepl("^s|seed", extract, ignore.case = TRUE), "Seed",
+                    fifelse(grepl("^p|tissue|plant", extract, ignore.case = TRUE), "Tissue",
+                    fifelse(grepl("germ", extract, ignore.case = TRUE), "Germinating", "Other")))]
+stopifnot(nrow(md) == 5962L)
+saveRDS(md, file.path(DERIVED_DIR, "metadata_combined.rds"))
+message(sprintf("samples: 16S %d + ITS %d = %d", sum(md$dataset == "16S"),
+                sum(md$dataset == "ITS"), nrow(md)))
+```
+
+```{r dataset-country-data}
+# 国家计数供地图与 Fig1B 使用 / Country counts for the map and Fig1B.
+md_geo <- md[Country != "unknown"]
+cc <- md_geo[, .(n_16s = sum(dataset == "16S"), n_its = sum(dataset == "ITS")), by = Country]
+cc[, total := n_16s + n_its][order(-total)]
+write_tsv(cc, file.path(DERIVED_DIR, "dataset", "country_counts.tsv"))
+```
+
+```{r dataset-map}
+# Fig1A 全球样本分布图 / Global sample map.
+map_script <- file.path(PROJECT_ROOT, "scripts", "python", "map_sample_distribution.py")
+shapefile <- file.path(DATA_DIR, "gis", "ne_110m_admin_0_countries.shp")
+python <- Sys.getenv("SEED_PYTHON", unset = Sys.which("python"))
+if (!nzchar(python)) stop("Python not found / 未找到 Python")
+checkpoint(file.path(FIG_DIR, c("Fig1A_Global_sample_distribution_map.pdf",
+                                "Fig1A_Global_sample_distribution_map.jpg")),
+           "fig1a", {
+  status <- system2(python, c(shQuote(map_script),
+    "--input", shQuote(file.path(DERIVED_DIR, "dataset", "country_counts.tsv")),
+    "--shapefile", shQuote(shapefile),
+    "--outdir", shQuote(FIG_DIR),
+    "--prefix", shQuote("Fig1A_Global_sample_distribution_map")))
+  if (status != 0L) stop("map generation failed / 地图生成失败")
+})
+```
+
+```{r dataset-panels}
+# Fig1B 国家组成 / Country composition.
+p_ctry <- draw_pie_chart(as.data.frame(md_geo), data_col = "Country",
+                         label = FALSE, pre = TRUE, legend_t = "Country",
+                         limit_n = 10, color_list = PAL2) +
+  labs(title = "Top 10 countries by samples (others combined)")
+save_panel(p_ctry, "Fig1B_Top_countries", 6, 5.2)
+
+# Fig1C/D 来源 × 区段，按数据集拆分 / Source by region, split by dataset.
+source_region_plot <- function(ds) {
+  d <- md[dataset == ds, .N, by = .(source, region)]
+  ggplot(d, aes(source, N, fill = region)) +
+    geom_col(width = 0.72, colour = "white", linewidth = 0.3) +
+    geom_text(aes(label = N), position = position_stack(vjust = 0.5),
+              size = 2.6, colour = "white") +
+    scale_fill_manual(values = setNames(PAL1[1:6], REG_ORDER), name = "Region") +
+    labs(x = NULL, y = "Number of samples", title = paste("Samples by source and region:", ds)) +
+    TH + theme(axis.text.x = element_text(angle = 0))
+}
+save_panel(source_region_plot("16S"), "Fig1C_Sample_source_region_16S", 6.2, 4.2)
+save_panel(source_region_plot("ITS"), "Fig1D_Sample_source_region_ITS", 6.2, 4.2)
+
+# Fig1G 样本类型 / Sample type.
+p_type <- draw_pie_chart(as.data.frame(md), data_col = "extract_std",
+                         label = TRUE, pre = TRUE, legend_t = "Sample type",
+                         limit_n = 26, color_list = PAL2) +
+  labs(title = "Sample type composition")
+save_panel(p_type, "Fig1G_Sample_type_composition", 6, 4.2)
+
+# Fig1H/I 宿主属 Top15 / Host genus Top15.
+genus_top_plot <- function(ds) {
+  d <- head(md[dataset == ds, .N, by = Genus][order(-N)], 15)
+  d[, Genus := factor(Genus, levels = rev(Genus))]
+  ggplot(d, aes(Genus, N, fill = Genus)) +
+    geom_col(show.legend = FALSE, width = 0.7) + coord_flip() +
+    geom_text(aes(label = N), hjust = -0.1, size = 3) +
+    scale_fill_manual(values = rep(PAL2, length.out = nrow(d))) +
+    labs(x = NULL, y = "Samples", title = paste0("Top 15 host genera (", ds, ")")) +
+    TH + theme(panel.grid.major.y = element_blank())
+}
+save_panel(genus_top_plot("16S"), "Fig1H_Host_genera_16S", 6, 4.5)
+save_panel(genus_top_plot("ITS"), "Fig1I_Host_genera_ITS", 6, 4.5)
+```
+
+```{r dataset-annotation}
+# Fig1E/F 属水平 reads 注释比例 / Genus-level read annotation fraction.
+genus_frac <- function(ds) {
+  tax <- data.table::fread(file.path(DATA_DIR, "filtered_merge", ds,
+                                     sprintf("Merged_%s_taxonomy_filtered.txt", ds)))
+  data.table::setnames(tax, 1, "ASV_ID")
+  ok <- tax[!is.na(Genus) & Genus != "" & Genus != "Unassigned", ASV_ID]
+  tab <- data.table::fread(file.path(DATA_DIR, "filtered_merge", ds,
+                                     sprintf("Merged_%s_table_filtered.txt", ds)),
+                           colClasses = list(character = 1))
+  data.table::setnames(tab, 1, "ASV_ID")
+  m <- as.matrix(tab[, -1, with = FALSE])
+  tot <- colSums(m)
+  gsum <- colSums(m[tab$ASV_ID %in% ok, , drop = FALSE])
+  data.table::data.table(Sample = names(tot), dataset = ds, total_reads = tot,
+                         genus_reads = gsum,
+                         genus_pct = round(ifelse(tot > 0, gsum / tot * 100, 0), 4))
+}
+frac_16s <- genus_frac("16S")
+frac_its <- genus_frac("ITS")
+write_tsv(rbind(frac_16s, frac_its), file.path(DERIVED_DIR, "dataset", "genus_annotation_fraction.tsv"))
+frac_plot <- function(d, col) {
+  ggplot(d, aes(genus_pct)) +
+    geom_histogram(breaks = seq(0, 100, 5), fill = col, colour = "white", linewidth = 0.2) +
+    scale_x_continuous(breaks = seq(0, 100, 20), expand = expansion(mult = c(0.005, 0.005))) +
+    coord_cartesian(xlim = c(0, 100)) +
+    labs(x = "Fraction of reads assigned to genus (%)", y = "Number of samples",
+         title = d$dataset[1],
+         subtitle = sprintf("n = %d samples, median = %.1f%%", nrow(d), median(d$genus_pct))) +
+    TH + theme(plot.title = element_text(face = "bold"))
+}
+save_panel(frac_plot(frac_16s, "#3A5A40"), "Fig1E_Genus_annotation_16S", 5.2, 4.5)
+save_panel(frac_plot(frac_its, "#D97B29"), "Fig1F_Genus_annotation_ITS", 5.2, 4.5)
+```
+
+```{r dataset-tables}
+# 数据集汇总表与 Table S2/S3 / Overview tables and Table S2/S3.
+row_sum <- function(d, dataset_label, region_label) {
+  data.table::data.table(dataset = dataset_label, region = region_label, samples = nrow(d),
+    studies = data.table::uniqueN(d$Cite),
+    countries = data.table::uniqueN(d[Country != "unknown"]$Country),
+    host_genera = data.table::uniqueN(d$Genus),
+    host_species = data.table::uniqueN(d$species),
+    seed_samples = sum(d$extract_std == "Seed"),
+    tissue_samples = sum(d$extract_std == "Tissue"),
+    other_samples = sum(!d$extract_std %in% c("Seed", "Tissue")),
+    seed_pct = round(100 * sum(d$extract_std == "Seed") / nrow(d), 1))
+}
+regs_16s <- REG_ORDER[1:4]; regs_its <- REG_ORDER[5:6]
+t1 <- data.table::rbindlist(c(
+  list(row_sum(md[dataset == "16S"], "16S", "All")),
+  lapply(regs_16s, function(r) row_sum(md[dataset == "16S" & Region == r], "16S", r)),
+  list(row_sum(md[dataset == "ITS"], "ITS", "All")),
+  lapply(regs_its, function(r) row_sum(md[dataset == "ITS" & Region == r], "ITS", r)),
+  list(row_sum(md, "ALL", "All"))))
+write_tsv(t1, file.path(TAB_DIR, "Table1_data_overview.tsv"))
+t2 <- data.table::rbindlist(lapply(c("16S", "ITS"), function(ds)
+  data.table::rbindlist(lapply(SRC_ORDER, function(s) row_sum(md[dataset == ds & source == s], ds, s)))))
+data.table::setnames(t2, "region", "source")
+write_tsv(t2, file.path(TAB_DIR, "Table2_source_summary.tsv"))
+
+t3 <- data.table::dcast(md_geo, Country ~ Region, fun.aggregate = length, value.var = "SampleID")
+for (r in REG_ORDER) if (!r %in% names(t3)) t3[, (r) := 0L]
+data.table::setcolorder(t3, c("Country", REG_ORDER))
+t3[, (REG_ORDER) := lapply(.SD, function(x) data.table::fifelse(is.na(x), 0L, x)), .SDcols = REG_ORDER]
+t3[, n_16s := rowSums(.SD), .SDcols = regs_16s][, n_its := rowSums(.SD), .SDcols = regs_its]
+t3[, total := n_16s + n_its][order(-total)]
+write_tsv(t3, file.path(TAB_DIR, "Table3_region_by_country.tsv"))
+
+t4 <- md[, .(samples = .N), by = .(dataset, Genus)][, pct := round(100 * samples / sum(samples), 2), by = dataset][order(dataset, -samples)]
+data.table::setnames(t4, "Genus", "host_genus")
+write_tsv(t4, file.path(TAB_DIR, "Table4_host_genus.tsv"))
+t5 <- md[, .(samples = .N), by = .(dataset, species)][, pct := round(100 * samples / sum(samples), 2), by = dataset][order(dataset, -samples)]
+data.table::setnames(t5, "species", "host_species")
+write_tsv(t5, file.path(TAB_DIR, "Table5_host_species.tsv"))
+
+gt <- md[, .N, by = .(Cite, Genus)][order(Cite, -N)][, .(top_genus = Genus[1], top_genus_n = N[1]), by = Cite]
+t6 <- md[, .(n_16s = sum(dataset == "16S"), n_its = sum(dataset == "ITS"), total = .N,
+             n_countries = data.table::uniqueN(Country[Country != "unknown"]),
+             region_16s = paste(unique(Region[dataset == "16S"]), collapse = ","),
+             region_its = paste(unique(Region[dataset == "ITS"]), collapse = ","),
+             bio_projects = paste(unique(bio_project), collapse = ";"),
+             seed_pct = round(100 * sum(extract_std == "Seed") / .N, 1)), by = Cite][gt, on = "Cite"]
+t6[, source := data.table::fifelse(Cite == "S54", SRC_ORDER[2],
+                           data.table::fifelse(Cite == "S55", SRC_ORDER[3], SRC_ORDER[1]))]
+data.table::setcolorder(t6, c("Cite", "source", "n_16s", "n_its", "total", "region_16s",
+                              "region_its", "n_countries", "top_genus", "top_genus_n",
+                              "seed_pct", "bio_projects"))
+write_tsv(t6[order(-total)], file.path(TAB_DIR, "Table6_study_list.tsv"))
+```
+
+```{r dataset-sample-summary}
+# Table S3 宿主属样本/研究覆盖 / Host genus coverage.
+tree_file <- file.path(TREE_DIR, "plant_Genus_tree_all.nwk")
+assert_files(tree_file, "genus tree")
+sample_md <- rbind(m16[, type := "16S"], mits[, type := "ITS"], fill = TRUE)
+sample_summary <- sample_md[, .(
+  samples_16s = sum(type == "16S"), samples_its = sum(type == "ITS"),
+  studies_16s = data.table::uniqueN(Cite[type == "16S"]),
+  studies_its = data.table::uniqueN(Cite[type == "ITS"]),
+  references = paste(sort(unique(Cite)), collapse = "; ")), by = .(Order, Genus)]
+sample_summary[, `:=`(ratio_samples = paste(samples_16s, samples_its, sep = "/"),
+                      ratio_studies = paste(studies_16s, studies_its, sep = "/"))]
+tree_label <- ape::read.tree(tree_file)$tip.label
+sample_summary <- merge(data.table::data.table(index = seq_along(tree_label), Genus = tree_label),
+                        sample_summary, by = "Genus")[order(index)]
+write_tsv(sample_summary, file.path(TAB_DIR, "TableS3_host_genus_coverage.tsv"))
+
+# Table S2 = 全部样本 metadata / all-sample metadata.
+meta_out <- rbind(m16[, dataset := "16S"], mits[, dataset := "ITS"], fill = TRUE)
+writexl::write_xlsx(list(metadata_all = as.data.frame(meta_out)),
+                    file.path(TAB_DIR, "Table S2.xlsx"))
+writexl::write_xlsx(list(sample_summary = as.data.frame(sample_summary)),
+                    file.path(TAB_DIR, "Table S3.xlsx"))
+message("Table S2/S3 written / 已写出 Table S2/S3")
+```

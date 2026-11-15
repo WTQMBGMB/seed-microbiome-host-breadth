@@ -1,0 +1,284 @@
+```{r host-phylo-setup}
+# 宿主系统发育与群落组装章节 / Host phylogeny and assembly chapter.
+source(file.path(PROJECT_ROOT <- normalizePath(Sys.getenv("SEED_PROJECT_ROOT", unset = getwd()), winslash = "/"), "R", "config.R"))
+source(file.path(PROJECT_ROOT, "R", "io.R"))
+source(file.path(PROJECT_ROOT, "R", "diversity.R"))
+suppressMessages({library(data.table); library(ggplot2); library(dplyr); library(patchwork); library(vegan); library(ggtree)})
+all_data <- readRDS(file.path(CKPT_DIR, "02_alpha_beta", "alpha_data.rds"))
+color_map_flat <- readRDS(file.path(DERIVED_DIR, "color_map_flat.rds"))
+```
+
+```{r host-alpha-phylosig}
+# Fig3A–C 与 FigS4A–C：宿主系统发育信号 / Host phylogenetic signal of alpha diversity.
+phylosig_rows <- list()
+set.seed(123L)
+for (idx in c("Shannon", "Observed")) {
+  for (reg in REGIONS3) {
+    res <- phylo_alpha_plot(all_data[[reg]], alpha_idx = idx, color_map = color_map_flat,
+                            save = FALSE, log10_transform = idx == "Observed")
+    letter <- c(v4 = "A", v5_v7 = "B", its1 = "C")[[reg]]
+    stem <- if (idx == "Shannon")
+      paste0("Fig3", letter, "_Alpha_phylosignal_", REGION_LAB[[reg]]) else
+      paste0("FigS4", letter, "_Alpha_phylosignal_Observed_", REGION_LAB[[reg]])
+    save_panel(res$plot, stem, 7.2, 7.2)
+    phylosig_rows[[paste(idx, reg)]] <- data.frame(
+      index = idx, region = reg,
+      K = if (!is.null(res$phylosig_K)) res$phylosig_K$K else NA_real_,
+      K_P = if (!is.null(res$phylosig_K)) res$phylosig_K$P else NA_real_,
+      lambda = if (!is.null(res$phylosig_L)) res$phylosig_L$lambda else NA_real_,
+      lambda_P = if (!is.null(res$phylosig_L)) res$phylosig_L$P else NA_real_)
+  }
+}
+write_tsv(do.call(rbind, phylosig_rows), file.path(TAB_DIR, "phylosig_results.tsv"))
+```
+
+```{r host-beta-phylosig}
+# Fig3D–F：宿主系统发育距离 vs 群落差异 / Mantel, MRM and dbRDA.
+mantel_rows <- list()
+set.seed(123L)
+for (reg in REGIONS3) {
+  bd <- readRDS(use_server(file.path("beta", paste0("bray_dist_", reg, ".rds"))))
+  res <- mantel_mrm_analysis(all_data[[reg]], bray_dist = bd)
+  mantel_rows[[reg]] <- data.frame(Region = reg, Mantel_r = res$mantel_r,
+    Mantel_P = res$mantel_p, MRM_R2 = res$mrm_r2, MRM_R2_P = res$mrm_r2p,
+    MRM_F = res$mrm_F, MRM_F_P = res$mrm_Fp, dbRDA_R2 = res$dbrda_r2,
+    dbRDA_P = res$dbrda_p, N_Species = res$n_species)
+  letter <- c(v4 = "D", v5_v7 = "E", its1 = "F")[[reg]]
+  save_panel(res$plot_mantel + labs(title = REGION_LAB[[reg]]),
+             paste0("Fig3", letter, "_Mantel_", REGION_LAB[[reg]]), 5, 4.5)
+}
+write_tsv(do.call(rbind, mantel_rows), file.path(TAB_DIR, "mantel_mrm_results.tsv"))
+```
+
+```{r host-permutation}
+# Fig3G–J：研究×种分组置换零分布 / Study-by-species permutation nulls.
+alpha_perm <- data.table::fread(use_server(file.path("phylo", "phylo_perm_alpha.tsv")))
+beta_perm  <- data.table::fread(use_server(file.path("phylo", "phylo_perm_beta.tsv")))
+nulls <- readRDS(use_server(file.path("phylo", "phylo_perm_nulls.rds")))
+alpha_perm <- alpha_perm[mode %in% c("before_global", "after_free")]
+beta_perm <- beta_perm[mode == "global"]
+REG_LAB <- c(v4 = "V4", v5_v7 = "V5-V7", its1 = "ITS1")
+MODE_LAB <- c(before_global = "Stratified\nnull", after_free = "Free\nnull")
+star <- function(p) ifelse(is.na(p), "", ifelse(p <= .001, "***", ifelse(p <= .01, "**", ifelse(p <= .05, "*", "ns"))))
+alpha_perm[, `:=`(region_lab = factor(REG_LAB[region], levels = REG_LAB),
+                  mode_lab = factor(MODE_LAB[mode], levels = MODE_LAB),
+                  index = factor(index, levels = c("Shannon", "Observed (log10)")), sig = star(p_one_sided))]
+alpha_null <- data.table::rbindlist(lapply(names(nulls$alpha), function(k) {
+  parts <- strsplit(k, " ", fixed = TRUE)[[1]]
+  data.table::rbindlist(lapply(names(nulls$alpha[[k]]), function(m)
+    data.table::data.table(region = parts[1], index = paste(parts[-1], collapse = " "),
+                           mode = m, value = as.numeric(nulls$alpha[[k]][[m]]))))
+}))
+alpha_null[, `:=`(region_lab = factor(REG_LAB[region], levels = REG_LAB),
+                  mode_lab = factor(MODE_LAB[mode], levels = MODE_LAB),
+                  index = factor(index, levels = c("Shannon", "Observed (log10)")))]
+alpha_panel <- function(reg) {
+  a <- alpha_perm[region == reg]; an <- alpha_null[region == reg]
+  ggplot() +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey65") +
+    geom_jitter(data = an, aes(mode_lab, value, colour = index, group = index),
+                position = position_jitterdodge(jitter.width = .16, dodge.width = .65),
+                size = .8, alpha = .3, stroke = 0) +
+    geom_point(data = a, aes(mode_lab, observed, colour = index, group = index),
+               position = position_jitterdodge(jitter.width = 0, dodge.width = .65),
+               shape = 18, size = 4) +
+    geom_text(data = a, aes(mode_lab, observed + .045, label = sig, group = index),
+              position = position_jitterdodge(jitter.width = 0, dodge.width = .65),
+              size = 2.8, vjust = 0, colour = "grey20") +
+    scale_colour_manual(values = c("Shannon" = "#0072B2", "Observed (log10)" = "#D55E00"), name = "Index") +
+    scale_x_discrete(drop = FALSE) +
+    scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, .25), expand = c(0, 0)) +
+    labs(x = NULL, y = "Pagel's lambda", title = paste("Alpha:", REG_LAB[reg])) +
+    theme_bw(base_size = 10.5) + theme(panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(), plot.title = element_text(size = 10.5, face = "bold"))
+}
+for (reg in REGIONS3) {
+  letter <- c(v4 = "G", v5_v7 = "H", its1 = "I")[[reg]]
+  save_panel(alpha_panel(reg), paste0("Fig3", letter, "_Phylo_permutation_", REG_LAB[[reg]]), 4.2, 4.6)
+}
+beta_null <- data.table::rbindlist(lapply(names(nulls$beta), function(reg)
+  data.table::data.table(region = reg, value = as.numeric(nulls$beta[[reg]][["global"]]))))
+beta_null[, region_lab := factor(REG_LAB[region], levels = REG_LAB)]
+beta_perm[, `:=`(region_lab = factor(REG_LAB[region], levels = REG_LAB), sig = star(p_one_sided))]
+pJ <- ggplot() +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey65") +
+  geom_jitter(data = beta_null, aes(region_lab, value), width = .18, height = 0, size = .8, alpha = .3, colour = "#0072B2", stroke = 0) +
+  geom_point(data = beta_perm, aes(region_lab, observed), shape = 18, size = 4, colour = "#D55E00") +
+  geom_text(data = beta_perm, aes(region_lab, observed + .015, label = sig), size = 2.8, vjust = 0, colour = "grey20") +
+  scale_y_continuous(limits = c(-.15, .45), breaks = seq(-.1, .4, .1), expand = c(0, 0)) +
+  labs(x = NULL, y = "Mantel r") + theme_bw(base_size = 10.5) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.x = element_blank())
+save_panel(pJ, "Fig3J_Phylo_permutation_beta", 4, 3.8)
+```
+
+```{r host-lambda-bootstrap}
+# FigS4D–I：λ bootstrap 分布 / Lambda bootstrap distributions.
+boot <- readRDS(use_server(file.path("phylo", "boot_lambda_samples.rds")))
+ci <- data.table::fread(use_server(file.path("phylo", "phylosig_lambda_ci.tsv")))
+idx_map <- c(Shannon = "Shannon", Observed = "Observed (log10)")
+kg_col <- c(Bacteria = "#0072B2", Fungi = "#D55E00")
+for (reg in REGIONS3) for (idx in c("Shannon", "Observed")) {
+  key <- paste0(reg, "_", idx)
+  if (!key %in% names(boot)) next
+  d <- data.table::data.table(lambda = boot[[key]])
+  row <- ci[region == reg & index == idx]
+  p <- ggplot(d, aes(lambda)) +
+    geom_histogram(aes(fill = if (reg == "its1") "Fungi" else "Bacteria"), bins = 40, colour = "white", linewidth = .15) +
+    geom_vline(xintercept = row$ci_low, linetype = "dashed", colour = "grey40") +
+    geom_vline(xintercept = row$ci_high, linetype = "dashed", colour = "grey40") +
+    geom_vline(xintercept = row$lambda, colour = "black", linewidth = .6) +
+    scale_fill_manual(values = kg_col, guide = "none") +
+    labs(x = "Bootstrap Pagel's lambda", y = "Count",
+         title = paste(REG_LAB[reg], "·", idx_map[[idx]])) +
+    theme_bw(base_size = 10.5) + theme(strip.background = element_rect(fill = "grey92"),
+      plot.title = element_text(face = "bold", hjust = .5))
+  letter <- if (idx == "Shannon") c(v4 = "D", v5_v7 = "E", its1 = "F")[[reg]] else
+            c(v4 = "G", v5_v7 = "H", its1 = "I")[[reg]]
+  suffix <- if (idx == "Shannon") "" else "_Observed"
+  save_panel(p, paste0("FigS4", letter, "_Lambda_bootstrap", suffix, "_", REG_LAB[reg]), 4, 3.6)
+}
+```
+
+```{r host-table-s4}
+# Table S4：17 个条件宿主关联 + 敏感性 / Sensitivity tables (historical Table_S7).
+sens_dir <- file.path(SERVER_DIR, "sensitivity")
+files <- c(A = "Table_S7A_host_association.tsv", B = "Table_S7B_alpha_phylogeny.tsv",
+           C = "Table_S7C_community_phylogeny.tsv", D = "Table_S7D_dispersion.tsv")
+sheets <- lapply(files, function(f) as.data.frame(data.table::fread(file.path(sens_dir, f))))
+names(sheets) <- paste0("Table_S4", names(files))
+writexl::write_xlsx(sheets, file.path(TAB_DIR, "Table S4.xlsx"))
+```
+
+```{r host-bnti}
+# Fig3K–M：群落组装过程 / Assembly processes from archived bNTI pair tables.
+PAIR_DIR <- file.path(SERVER_DIR, "bnti", "local")
+proc_lev <- c("Heterogeneous_selection", "Homogeneous_selection", "Dispersal_limitation", "Homogenizing_dispersal", "Drift")
+crlev <- c("Same_Species", "Cross_Species", "Cross_Genus", "Cross_Family", "Cross_Order", "Cross_Class", "Cross_Phylum")
+grp_lev <- c("Same-country", "Cross-country")
+proc_cols <- c(Heterogeneous_selection = "#E76F51", Homogeneous_selection = "#F2CC8F",
+               Dispersal_limitation = "#547FB6", Homogenizing_dispersal = "#1D3557", Drift = "#E4E2C9")
+fmt_p <- function(p) ifelse(p < .001, "P < 0.001", sprintf("P = %.3f", p))
+
+s54 <- data.table::fread(file.path(PAIR_DIR, "s54_v5_v7_pairs.tsv"))
+s54 <- s54[!is.na(betaNTI) & !is.na(RCbray)]
+s54[, Process := factor(Process, levels = proc_lev)][, GeneticBin := factor(GeneticBin, levels = crlev)]
+s54_sum <- s54[, .(n_pairs = .N, frac_total = .N / nrow(s54)), by = Process]
+s54_sum[, nature := ifelse(Process %in% c("Heterogeneous_selection", "Homogeneous_selection"), "Deterministic", "Stochastic")]
+write_tsv(s54_sum, file.path(TAB_DIR, "bnti_s54_process_summary.tsv"))
+con <- s54[, .(n_pairs = .N), by = .(Process, GeneticBin)][n_pairs > 0]
+con[, Fraction := n_pairs / sum(n_pairs), by = GeneticBin]
+con[, GeneticBin := factor(as.character(GeneticBin), levels = crlev)][, Process := factor(as.character(Process), levels = proc_lev)]
+n_by_bin <- con[, .(n_pairs = sum(n_pairs)), by = GeneticBin][order(GeneticBin)]
+tab <- table(s54$Process, s54$GeneticBin); tab <- tab[rowSums(tab) > 0, colSums(tab) > 0, drop = FALSE]
+ct <- suppressWarnings(chisq.test(tab))
+cramer_v <- as.numeric(sqrt(ct$statistic / (sum(tab) * (min(dim(tab)) - 1))))
+set.seed(777); NPERM <- 999L
+obs_proc <- factor(as.character(s54$Process), levels = rownames(tab))
+obs_bin <- factor(as.character(s54$GeneticBin), levels = colnames(tab))
+chi_null <- numeric(NPERM)
+for (k in seq_len(NPERM)) chi_null[k] <- suppressWarnings(chisq.test(table(obs_proc[sample(nrow(s54))], obs_bin))$statistic)
+p_perm <- (1 + sum(chi_null >= as.numeric(ct$statistic))) / (NPERM + 1)
+write_tsv(data.table::data.table(test = "Process x lineage bin", statistic = as.numeric(ct$statistic),
+  df = as.integer(ct$parameter), p.value = ct$p.value, cramers_V = round(cramer_v, 4),
+  p_permute_within_pool = p_perm), file.path(TAB_DIR, "bnti_s54_lineage_chi2.tsv"))
+pK <- ggplot(con, aes(x = GeneticBin, y = Fraction, fill = Process)) +
+  geom_col(width = .8) +
+  geom_text(data = n_by_bin, aes(x = GeneticBin, y = 1.02, label = sprintf("n = %d", n_pairs)), inherit.aes = FALSE, size = 3, vjust = 0) +
+  scale_fill_manual(values = proc_cols) + scale_y_continuous(expand = expansion(mult = c(0, .06))) +
+  labs(x = "Host lineage crossing level (exclusive)", y = "Fraction of pairs", fill = "Assembly process") +
+  theme_bw() + theme(legend.position = "bottom", axis.text.x = element_text(angle = 30, hjust = 1))
+save_panel(pK, "Fig3K_Self_sequenced_assembly_processes", 8, 5)
+
+v4 <- data.table::fread(file.path(PAIR_DIR, "v4_genus_pairs.tsv"))
+v4 <- v4[!is.na(betaNTI) & !is.na(RCbray)]
+v4[, Group := factor(ifelse(SameCountry, "Same-country", "Cross-country"), levels = grp_lev)]
+v4[, Process := factor(Process, levels = proc_lev)]
+summ <- v4[, .(n_pairs = .N), by = .(Group, Process)]
+summ <- merge(data.table::CJ(Group = factor(grp_lev, levels = grp_lev), Process = factor(proc_lev, levels = proc_lev)), summ, by = c("Group", "Process"), all.x = TRUE)
+summ[is.na(n_pairs), n_pairs := 0L][, n_total := sum(n_pairs), by = Group][, frac_group := n_pairs / n_total]
+write_tsv(summ[, .(Group, Process, n_pairs, n_total, frac_group)], file.path(TAB_DIR, "bnti_country_process_summary.tsv"))
+tab4 <- table(v4$Process, v4$Group); tab4 <- tab4[rowSums(tab4) > 0, colSums(tab4) > 0, drop = FALSE]
+ct4 <- suppressWarnings(chisq.test(tab4)); set.seed(777)
+ct4_sim <- suppressWarnings(chisq.test(tab4, simulate.p.value = TRUE, B = 9999))
+cramer4 <- as.numeric(sqrt(ct4$statistic / (sum(tab4) * (min(dim(tab4)) - 1))))
+write_tsv(data.table::data.table(Region = "v4", n_same = sum(v4$Group == "Same-country"),
+  n_cross = sum(v4$Group == "Cross-country"), chi2 = as.numeric(ct4$statistic),
+  df = as.integer(ct4$parameter), p_mc = ct4_sim$p.value, cramers_V = round(cramer4, 4)),
+  file.path(TAB_DIR, "bnti_country_chi2.tsv"))
+tot <- summ[, .(n_total = sum(n_pairs)), by = Group]
+pL <- ggplot(summ, aes(x = Group, y = frac_group, fill = Process)) +
+  geom_col(width = .7) +
+  geom_text(data = tot, inherit.aes = FALSE, aes(x = Group, y = 1.02, label = sprintf("n=%s", format(n_total, big.mark = ","))), size = 3.2) +
+  annotate("text", x = 1.5, y = 1.14, label = sprintf("Cramer's V = %.3f\n%s (9,999 replicates)", cramer4, fmt_p(ct4_sim$p.value)), size = 3.4) +
+  scale_fill_manual(values = proc_cols) + scale_y_continuous(labels = function(x) sprintf("%.0f%%", 100 * x), limits = c(0, 1.26)) +
+  labs(x = NULL, y = "Fraction within country-group", fill = "Assembly process") + theme_bw() + theme(legend.position = "bottom")
+save_panel(pL, "Fig3L_Country_assembly_composition", 6, 5)
+pM <- ggplot(summ, aes(x = Process, y = frac_group, fill = Group)) +
+  geom_col(position = position_dodge(width = .7), width = .6) +
+  geom_text(aes(label = sprintf("%.0f%%", 100 * frac_group)), position = position_dodge(width = .7), vjust = -.3, size = 2.6) +
+  scale_fill_manual(values = c("Same-country" = "#547FB6", "Cross-country" = "#F6BD60")) +
+  scale_y_continuous(labels = function(x) sprintf("%.0f%%", 100 * x), limits = c(0, max(summ$frac_group) * 1.18)) +
+  labs(x = NULL, y = "Fraction within country-group", fill = "Country pair type") + theme_bw() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1), legend.position = "top")
+save_panel(pM, "Fig3M_Country_assembly_compare", 8, 5)
+```
+
+```{r host-asv-phylo}
+# FigS5A–C：mapped-bin ASV 系统发育与宿主分布 / ASV-level phylogeny vs host distribution.
+ASV <- file.path(SERVER_DIR, "asv_beta_phylo")
+TAB_ASV <- file.path(ASV, "result_table", "cross_region")
+t1m <- data.table::fread(file.path(TAB_ASV, "track1_16s_mantel.tsv"))[region %in% c("V4", "V5_V7")]
+t1r <- data.table::fread(file.path(TAB_ASV, "track1_16s_mrm.tsv"))[region %in% c("V4", "V5_V7") & term == "dp" & model == "primary"]
+t1c <- data.table::fread(file.path(TAB_ASV, "track1_16s_close_far.tsv"))[region %in% c("V4", "V5_V7")]
+t2m <- data.table::fread(file.path(TAB_ASV, "track2_16s_mantel.tsv"))[region_a == "V4" & region_b == "V5_V7"]
+t2r <- data.table::fread(file.path(TAB_ASV, "track2_16s_mrm.tsv"))[region_a == "V4" & region_b == "V5_V7" & term == "dp" & model == "primary"]
+t2c <- data.table::fread(file.path(TAB_ASV, "track2_16s_close_far.tsv"))[region_a == "V4" & region_b == "V5_V7"]
+t2s <- data.table::fread(file.path(TAB_ASV, "track2_16s_sensitivity.tsv"))[region_a == "V4" & region_b == "V5_V7"]
+null_res <- data.table::fread(file.path(ASV, "paper_main", "null_model_results.tsv"))
+null_draws <- readRDS(file.path(ASV, "paper_main", "null_draws.rds"))
+unit_levels <- c("V4 (within)", "V5-V7 (within)", "V4-V5-V7 (shared)")
+unit_lab <- c(V4 = "V4 (within)", V5_V7 = "V5-V7 (within)")
+eff1 <- t1m[, .(unit = unit_lab[region], n_bins, metric, r, CI_low, CI_high, p = p_standard, p_strat = p_stratified)]
+eff2 <- t2m[, .(unit = "V4-V5-V7 (shared)", n_bins, metric, r, CI_low, CI_high, p = p_standard, p_strat = p_stratified)]
+eff <- rbind(eff1, eff2); eff[, unit := factor(unit, levels = unit_levels)][, metric := factor(metric, levels = c("J", "B"))]
+short1 <- t1c[, .(unit = unit_lab[region], metric, contrast, p, SES)]
+short2 <- t2c[, .(unit = "V4-V5-V7 (shared)", metric, contrast, p, SES)]
+short <- rbind(short1, short2); short[, unit := factor(unit, levels = unit_levels)][, metric := factor(metric, levels = c("J", "B"))]
+prim <- t2m[, .(scenario = "primary", metric, r, p = p_standard, n_bins)]
+sens <- t2s[, .(scenario = analysis, metric, r, p, n_bins)]
+sens <- rbind(prim, sens)
+sens[, scenario := factor(scenario, levels = c("primary", "within_min10", "pair_min", "pair_max"),
+                          labels = c("Primary", "Within-region n >= 10", "Pair min", "Pair max"))]
+sens[, metric := factor(metric, levels = c("J", "B"))]
+null_res[, unit := factor(unit, levels = unit_levels)][, metric := factor(metric, levels = c("J", "B"))][, sig := star(p_source_stratified)]
+null_draws[, unit := factor(unit, levels = unit_levels)][, metric := factor(metric, levels = c("J", "B"))]
+pA <- ggplot() +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey55") +
+  geom_jitter(data = null_draws, aes(unit, r, colour = metric), position = position_jitterdodge(jitter.width = .16, dodge.width = .60), size = .5, alpha = .25, stroke = 0) +
+  geom_pointrange(data = eff, aes(unit, r, ymin = CI_low, ymax = CI_high, colour = metric), position = position_dodge(width = .60), linewidth = .45, size = .25) +
+  geom_point(data = eff, aes(unit, r, colour = metric), position = position_dodge(width = .60), shape = 18, size = 3.8) +
+  geom_text(data = null_res, aes(unit, observed_r + .014, label = sig, colour = metric), position = position_dodge(width = .60), size = 3, vjust = 0, show.legend = FALSE) +
+  scale_colour_manual(values = c(J = "#2C6E9B", B = "#D17B2F"), labels = c(J = "Jaccard", B = "Bray-Curtis")) +
+  scale_x_discrete(labels = c("V4 (within)" = "V4\n(within)", "V5-V7 (within)" = "V5-V7\n(within)", "V4-V5-V7 (shared)" = "V4-V5-V7\n(shared)")) +
+  scale_y_continuous(limits = c(-.02, .235), breaks = seq(0, .2, .05)) +
+  labs(x = NULL, y = "Mantel r", colour = NULL) + theme_bw(base_size = 11) +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank(), panel.grid.major.x = element_blank())
+save_panel(pA, "FigS5A_ASV_phylogeny_mantel", 6, 5)
+pB <- ggplot(short, aes(x = contrast, y = unit, colour = metric)) +
+  geom_vline(xintercept = 0, linetype = 2, colour = "grey55") +
+  geom_point(size = 2.6, position = position_dodge(width = .35)) +
+  scale_colour_manual(values = c(J = "#2C6E9B", B = "#D17B2F"), labels = c(J = "Jaccard", B = "Bray-Curtis")) +
+  scale_x_continuous(limits = c(0, .06), breaks = seq(0, .05, .01)) +
+  labs(x = "Far 50% - closest 10% mean distance", y = NULL, colour = NULL) + theme_bw(base_size = 11) +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank())
+save_panel(pB, "FigS5B_ASV_phylogeny_close_far", 6, 4)
+pC <- ggplot(sens, aes(x = r, y = scenario, colour = metric)) +
+  geom_vline(xintercept = 0, linetype = 2, colour = "grey55") +
+  geom_point(size = 2.6, position = position_dodge(width = .35)) +
+  scale_colour_manual(values = c(J = "#2C6E9B", B = "#D17B2F"), labels = c(J = "Jaccard", B = "Bray-Curtis")) +
+  scale_x_continuous(limits = c(0, .17), breaks = seq(0, .15, .05)) +
+  labs(x = "Mantel r", y = NULL, colour = NULL) + theme_bw(base_size = 11) +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank())
+save_panel(pC, "FigS5C_ASV_phylogeny_sensitivity", 6, 4)
+write_tsv(eff, file.path(TAB_DIR, "ASV_phylogeny_effects.tsv"))
+```

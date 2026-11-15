@@ -1,0 +1,205 @@
+```{r traits-setup}
+# 功能性状与 KO 章节 / Functional trait and KO chapter.
+source(file.path(PROJECT_ROOT <- normalizePath(Sys.getenv("SEED_PROJECT_ROOT", unset = getwd()), winslash = "/"), "R", "config.R"))
+source(file.path(PROJECT_ROOT, "R", "io.R"))
+source(file.path(PROJECT_ROOT, "R", "sankey.R"))
+suppressMessages({library(data.table); library(ggplot2); library(dplyr); library(patchwork); library(ggrepel)})
+TR <- file.path(SERVER_DIR, "function_prediction", "result_tables")
+num <- data.table::fread(file.path(TR, "results_numeric_16s.tsv"))
+bool <- data.table::fread(file.path(TR, "results_boolean_twopart_16s.tsv"))
+ko <- data.table::fread(file.path(TR, "results_ko_twopart_16s.tsv"))
+```
+
+```{r traits-volcano}
+# Fig5A：数值性状火山图 / Numeric trait volcano.
+num[, neglog10 := -log10(FDR)]
+pA <- ggplot(num, aes(rho, neglog10)) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey60") +
+  geom_point(aes(colour = FDR < 0.05), size = 2) +
+  geom_text_repel(aes(label = ifelse(FDR < 0.05, sub("^metatraits_", "", trait), "")),
+                  size = 2.2, max.overlaps = 30, seed = 1) +
+  scale_colour_manual(values = c(`TRUE` = "#D55E00", `FALSE` = "grey65"), guide = "none") +
+  labs(x = "Spearman rho (n_hosts vs trait)", y = "-log10(BH-FDR)") +
+  theme_bw(base_size = 11)
+save_panel(pA, "Fig5A_Numeric_traits_host_breadth_volcano", 7, 5)
+```
+
+```{r traits-boolean-forest}
+# FigS10A–C：布尔性状 HBS 森林图，按数据库拆分 / Boolean HBS forests by database.
+trait_label <- function(x) {
+  x <- sub("^(bugbase|faprotax|metatraits)_", "", x)
+  gsub("[._]", " ", x)
+}
+bool[, trait_label := trait_label(trait)]
+for (src in c("bugbase", "faprotax", "metatraits")) {
+  d <- bool[source == src & FDR_pos < .05 & is.finite(OR_pos) & is.finite(OR_pos_lo) & is.finite(OR_pos_hi)]
+  if (!nrow(d)) next
+  d <- d[order(-OR_pos)][1:min(.N, 20)]
+  d[, trait_label := factor(trait_label, levels = trait_label[order(OR_pos)])]
+  p <- ggplot(d, aes(OR_pos, trait_label)) +
+    geom_vline(xintercept = 1, linetype = "dashed", colour = "grey60") +
+    geom_pointrange(aes(xmin = OR_pos_lo, xmax = OR_pos_hi, colour = state_pos), size = .35) +
+    scale_x_log10() +
+    scale_colour_manual(values = c(Positive = "#D55E00", Negative = "#0072B2", `Not significant` = "grey60"), drop = FALSE) +
+    labs(x = "Odds ratio (host-breadth slope)", y = NULL, colour = NULL, title = src) +
+    theme_bw(base_size = 10) + theme(panel.grid.minor = element_blank())
+  letter <- c(bugbase = "A", faprotax = "B", metatraits = "C")[[src]]
+  save_panel(p, paste0("FigS10", letter, "_Boolean_trait_forest_", src), 6, 7)
+}
+```
+
+```{r traits-boolean-3x3}
+# Fig5B：布尔性状 two-part 3×3 / Boolean two-part encoding.
+source_abbr <- function(x) {
+  ifelse(x == "bugbase", "BB",
+         ifelse(x == "faprotax", "FP",
+                ifelse(x == "metatraits", "MT", "OT")))
+}
+short_label <- function(x) {
+  y <- sub("^(bugbase|faprotax|metatraits)_", "", x)
+  y <- gsub("\\.\\.", " | ", y)
+  y <- gsub("\\.", " ", y)
+  y <- gsub("_", " ", y)
+  y <- sub("^enzyme activity \\| ", "", y)
+  y <- sub(" \\| EC.*$", "", y)
+  y <- sub("^growth \\| ", "", y)
+  y <- gsub("\\s+", " ", y)
+  y <- trimws(y)
+  ifelse(nchar(y) > 34, paste0(substr(y, 1, 31), "..."), y)
+}
+bool2 <- bool[estimable_zero == TRUE & estimable_pos == TRUE]
+bool2[, `:=`(x = log2(OR_zero), y = log2(OR_pos))]
+both_sig <- bool2[state_zero != "Not significant" &
+                    state_pos != "Not significant"]
+labs2 <- data.table::copy(both_sig)
+labs2[, label := paste0(source_abbr(source), ": ", short_label(trait))]
+
+pB <- ggplot(bool2, aes(x, y, colour = state_pos, shape = state_zero)) +
+  geom_hline(yintercept = 0, colour = "grey85") +
+  geom_vline(xintercept = 0, colour = "grey85") +
+  geom_point(size = 2.2, alpha = 0.85, stroke = 0.4) +
+  ggrepel::geom_text_repel(
+    data = labs2, aes(label = label), size = 2.73, colour = "black",
+    seed = 20261109, max.overlaps = Inf,
+    box.padding = 0.55, point.padding = 0.35,
+    min.segment.length = 0, force = 1.5,
+    max.time = 20, max.iter = 100000, show.legend = FALSE) +
+  scale_colour_manual(
+    values = c("Negative" = "#2E86C1", "Not significant" = "grey65",
+               "Positive" = "#E67E22"),
+    name = "Host-breadth slope\n(x_pos)") +
+  scale_shape_manual(
+    values = c("Negative" = 25, "Not significant" = 16, "Positive" = 15),
+    name = "One-host association\n(x_zero)") +
+  coord_cartesian(xlim = c(-0.75, 1), ylim = c(-1, 1)) +
+  labs(x = "log2 OR - one-host association (h=1 vs NRH)",
+       y = "log2 OR - host-breadth slope (per doubling, h >= 1)",
+       title = sprintf(
+         "16S: two-part trait-host breadth associations (%d traits; %d labelled)",
+         nrow(bool2), nrow(both_sig)),
+       subtitle = sprintf(paste0(
+         "All estimable traits plotted (n=%d); labels = OHA and HBS both FDR<0.05 (n=%d). ",
+         "Source: FP=FAPROTAX2, BB=BugBase, MT=metaTraits. ",
+         "Colour=HBS state, shape=OHA state."), nrow(bool2), nrow(both_sig))) +
+  theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "right",
+        plot.title = element_text(face = "bold"))
+save_panel(pB, "Fig5B_Boolean_trait_two_part_3x3", 10.5, 8.2)
+```
+
+```{r traits-ko-3x3}
+# Fig5C：KO two-part 3×3 / KO two-part encoding.
+ko2 <- ko[both_finite == TRUE]
+ko2[, `:=`(x = log2(OR_zero), y = log2(OR_pos))]
+ko2 <- ko2[is.finite(x) & is.finite(y)]
+
+# 按 0.5–99.5% 分位裁剪，并在九宫格内标注计数。
+# Clip at 0.5–99.5% quantiles and annotate nine-cell counts.
+qx <- as.numeric(quantile(ko2$x, c(0.005, 0.995), na.rm = TRUE))
+qy <- as.numeric(quantile(ko2$y, c(0.005, 0.995), na.rm = TRUE))
+qx <- range(c(qx, -0.5, 0.5))
+qy <- range(c(qy, -0.5, 0.5))
+ko2[, outside := x < qx[1] | x > qx[2] | y < qy[1] | y > qy[2]]
+
+counts3 <- data.table::fread(file.path(TR, "twopart_counts_ko_16s.tsv"))
+cell_lab <- counts3[1:9, .(state_zero, state_pos, n)]
+cell_lab[, x := ifelse(state_zero == "Negative", qx[1] * 0.66,
+                ifelse(state_zero == "Not significant", 0, qx[2] * 0.66))]
+cell_lab[, y := ifelse(state_pos == "Negative", qy[1] * 0.66,
+                ifelse(state_pos == "Not significant", 0, qy[2] * 0.66))]
+cell_lab[, lab := paste0("n=", n)]
+
+pC <- ggplot(ko2, aes(x, y, colour = state_pos, shape = state_zero)) +
+  geom_hline(yintercept = 0, colour = "grey85") +
+  geom_vline(xintercept = 0, colour = "grey85") +
+  geom_point(size = 0.9, alpha = 0.35, stroke = 0.2) +
+  geom_text(data = cell_lab, aes(x = x, y = y, label = lab),
+            inherit.aes = FALSE, size = 3.0, colour = "grey35") +
+  scale_colour_manual(
+    values = c("Negative" = "#2E86C1", "Not significant" = "grey65",
+               "Positive" = "#E67E22"),
+    name = "Host-breadth slope\n(x_pos)") +
+  scale_shape_manual(
+    values = c("Negative" = 25, "Not significant" = 16, "Positive" = 15),
+    name = "One-host association\n(x_zero)") +
+  coord_cartesian(xlim = qx, ylim = qy) +
+  labs(x = "log2 OR - one-host association (h=1 vs NRH)",
+       y = "log2 OR - host-breadth slope (per doubling, h >= 1)",
+       title = sprintf(
+         "16S KO: two-part associations with host breadth (n=%s finite of %s tested)",
+         format(nrow(ko2), big.mark = ","),
+         format(nrow(ko), big.mark = ",")),
+       subtitle = sprintf(paste0(
+         "FDR<0.05; colour = host-breadth slope, shape = one-host association (3x3). ",
+         "Axes clipped at 0.5-99.5%%; %d points outside. ",
+         "Boundary KOs (complete separation) excluded."),
+         sum(ko2$outside))) +
+  theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "right",
+        plot.title = element_text(face = "bold"))
+save_panel(pC, "Fig5C_KO_two_part_3x3", 5, 4)
+```
+
+```{r traits-ko-sankey}
+# Fig5D 与 FigS11A–B：KO 功能层级桑基 / KO functional Sankey.
+ko_panel <- function(prefix, absolute, show_legend, legend_title, pgpg) {
+  n <- data.table::fread(file.path(TR, paste0(prefix, "_nodes.tsv")))
+  l <- data.table::fread(file.path(TR, paste0(prefix, "_links.tsv")))
+  draw_ko_sankey(n, l, absolute = absolute, show_legend = show_legend,
+                 legend_title = legend_title, pgpg = pgpg)
+}
+save_panel(
+  ko_panel("ko_sankey_pgpg_lv3_16s_abs", TRUE, TRUE, "PGPG Lv3", TRUE),
+  "Fig5D_KO_PGPG_Lv3_actual_proportion", 10, 7)
+save_panel(
+  ko_panel("ko_sankey_kegg_lv2_16s", FALSE, FALSE, "KEGG level2", FALSE),
+  "FigS11A_KO_KEGG_Lv2_normalized", 10, 7)
+save_panel(
+  ko_panel("ko_sankey_kegg_lv2_16s_abs", TRUE, TRUE, "KEGG level2", FALSE),
+  "FigS11B_KO_KEGG_Lv2_actual_proportion", 10, 7)
+```
+
+```{r traits-sensitivity}
+# Fig5E 与 FigS12：来源 bootstrap 稳健/方向不一致性状 / Robust and discordant traits.
+rob <- data.table::fread(file.path(TR, "sensitivity_robust17.tsv"))
+dis <- data.table::fread(file.path(TR, "sensitivity_discordant9.tsv"))
+forest_sens <- function(d, title, colour) {
+  d <- d[is.finite(OR_Pool) & is.finite(OR_CI_low_Pool) & is.finite(OR_CI_high_Pool)]
+  d[, trait_label := factor(trait_label, levels = trait_label[order(OR_Pool)])]
+  ggplot(d, aes(OR_Pool, trait_label)) +
+    geom_vline(xintercept = 1, linetype = "dashed", colour = "grey60") +
+    geom_pointrange(aes(xmin = OR_CI_low_Pool, xmax = OR_CI_high_Pool), colour = colour, size = .35) +
+    scale_x_log10() + labs(x = "Pooled odds ratio", y = NULL, title = title) +
+    theme_bw(base_size = 10) + theme(panel.grid.minor = element_blank())
+}
+save_panel(forest_sens(rob, "Robust traits (17)", "#D55E00"), "Fig5E_Robust17_forest", 7, 6)
+save_panel(forest_sens(dis, "Discordant traits (9)", "#0072B2"), "FigS12_Discordant9_forest", 7, 5)
+```
+
+```{r traits-table}
+# Table S6 源表 / Table S6 source table.
+trait_table <- data.table::fread(file.path(SERVER_DIR, "function_prediction", "taxonomy_16s_traits.txt"))
+write_tsv(trait_table, file.path(TAB_DIR, "TableS6_taxonomy_16s_traits.tsv"))
+```

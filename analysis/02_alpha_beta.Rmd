@@ -1,0 +1,225 @@
+```{r alpha-beta-setup}
+# α/β 多样性章节：载入配置与共享工具 / Alpha-beta chapter setup.
+source(file.path(PROJECT_ROOT <- normalizePath(Sys.getenv("SEED_PROJECT_ROOT", unset = getwd()), winslash = "/"), "R", "config.R"))
+source(file.path(PROJECT_ROOT, "R", "io.R"))
+source(file.path(PROJECT_ROOT, "R", "diversity.R"))
+suppressMessages({library(data.table); library(ggplot2); library(dplyr); library(patchwork); library(ggpubr)})
+```
+
+```{r alpha-data}
+# 三个主区段的 α 多样性 / Alpha diversity for the three main regions.
+alpha_rds <- file.path(CKPT_DIR, "02_alpha_beta", "alpha_data.rds")
+checkpoint(alpha_rds, "alpha_data", {
+  all_data <- list()
+  for (reg in REGIONS3) {
+    d <- load_region_data(reg)
+    d$alpha <- calc_alpha_div(d$otu)
+    all_data[[reg]] <- d
+  }
+  saveRDS(all_data, alpha_rds)
+})
+all_data <- readRDS(alpha_rds)
+color_map_flat <- readRDS(file.path(DERIVED_DIR, "color_map_flat.rds"))
+```
+
+```{r alpha-boxplots}
+# FigS1 Shannon / FigS2 Observed；单行多面板整图 / Whole single-row multi-panel figures.
+kw <- list()
+kw[["Shannon"]] <- layered_boxplot(all_data, color_map_flat, alpha_idx = "Shannon",
+  prefix = "FigS1_Alpha_diversity_Shannon")$kw_results
+kw[["Observed"]] <- layered_boxplot(all_data, color_map_flat, alpha_idx = "Observed",
+  prefix = "FigS2_Alpha_diversity_Observed", log10_transform = TRUE)$kw_results
+write_tsv(rbindlist(kw, idcol = "index"), file.path(TAB_DIR, "alpha_kruskal_wallis.tsv"))
+```
+
+```{r beta-pcoa}
+# Fig2A–C：PCoA + adonis2（source + Genus + Country + extract）/ PCoA and marginal PERMANOVA.
+N_PERM <- 999L
+meta_by_region <- c(v4 = "metadata_16S.txt", v5_v7 = "metadata_16S.txt", its1 = "metadata_ITS.txt")
+region_filter <- c(v4 = "V4", v5_v7 = "V5_V7", its1 = "ITS1")
+adonis_rows <- list()
+pcoa_plots <- list()
+for (reg in REGIONS3) {
+  bd <- readRDS(use_server(file.path("beta", paste0("bray_dist_", reg, ".rds"))))
+  labs <- attr(bd, "Labels")
+  meta <- data.table::fread(file.path(DATA_DIR, "metadata", meta_by_region[[reg]]))[Region == region_filter[[reg]]]
+  design <- as.data.frame(meta[match(labs, meta$SampleID), ])
+  rownames(design) <- labs
+  for (v in c("source", "Genus", "Country", "extract")) design[[v]] <- droplevels(factor(design[[v]]))
+  stopifnot(!anyNA(design$source), !anyNA(design$Genus))
+  ck <- use_server(file.path("beta", "adonis2_source", paste0("adonis_Genus_", reg, ".rds")), required = FALSE)
+  if (is.null(ck) || recompute_step(paste0("adonis_", reg))) {
+    if (!ALLOW_SERVER_RECOMPUTE) stop("Missing adonis2 checkpoint; see server_result/README.md")
+    ad <- vegan::adonis2(bd ~ source + Genus + Country + extract, data = design,
+                         permutations = N_PERM, by = "margin", parallel = N_CORES)
+    ck <- file.path(CKPT_DIR, "02_alpha_beta", paste0("adonis_Genus_", reg, ".rds"))
+    dir.create(dirname(ck), recursive = TRUE, showWarnings = FALSE)
+    saveRDS(ad, ck)
+  } else {
+    ad <- readRDS(ck)
+  }
+  ad_tab <- as.data.frame(ad)
+  colnames(ad_tab)[colnames(ad_tab) == "Pr(>F)"] <- "P"
+  ad_tab$Factor <- rownames(ad_tab); ad_tab$Region <- reg; rownames(ad_tab) <- NULL
+  disp <- c(source = "Source", Genus = "Genus", Country = "Country", extract = "Extract")
+  adonis_rows[[reg]] <- transform(ad_tab, Factor = ifelse(Factor %in% names(disp), disp[Factor], Factor))[
+    , c("Region", "Factor", "Df", "SumOfSqs", "R2", "F", "P")]
+  pcoa <- stats::cmdscale(bd, k = 2, eig = TRUE)
+  pc <- as.data.frame(pcoa$points); colnames(pc) <- c("PCoA1", "PCoA2"); pc$SampleID <- rownames(pc)
+  pdat <- merge(pc, design, by.x = "SampleID", by.y = "row.names", all.x = TRUE)
+  eig <- pcoa$eig[pcoa$eig > 0]
+  v1 <- round(100 * eig[1] / sum(eig), 2); v2 <- round(100 * eig[2] / sum(eig), 2)
+  fmt_p <- function(p) ifelse(is.na(p), "", ifelse(p <= 0.001, "***", ifelse(p <= 0.01, "**", ifelse(p <= 0.05, "*", "ns"))))
+  ann <- data.frame(f = c("source", "Genus", "Country", "extract"))
+  ann$name <- disp[ann$f]
+  ann$R2 <- ad_tab$R2[match(ann$f, ad_tab$Factor)]
+  ann$P <- ad_tab$P[match(ann$f, ad_tab$Factor)]
+  ann <- ann[order(-ann$R2), ]
+  lab <- paste(sprintf("%-8s R²=%.3f %s", ann$name, ann$R2, fmt_p(ann$P)), collapse = "\n")
+  pcoa_plots[[reg]] <- ggplot(pdat, aes(PCoA1, PCoA2)) +
+    geom_point(aes(colour = Order), size = 1.6, alpha = 0.7) +
+    scale_colour_manual(values = color_map_flat$order, name = "Host Order", na.value = "#9E9E9E") +
+    annotate("label", x = Inf, y = Inf, label = lab, hjust = 1.02, vjust = 1.1,
+             size = 3.2, lineheight = 1.0, fill = "white", fontface = "bold") +
+    labs(x = paste0("PCoA1 (", v1, "%)"), y = paste0("PCoA2 (", v2, "%)"),
+         title = REGION_LAB[[reg]]) +
+    theme_bw(base_size = 11) + theme(panel.grid.minor = element_blank(),
+      plot.title = element_text(face = "bold", hjust = 0.5, size = 13))
+}
+write_tsv(rbindlist(adonis_rows), file.path(TAB_DIR, "adonis2_results_3regions.tsv"))
+for (reg in names(pcoa_plots)) {
+  letter <- c(v4 = "A", v5_v7 = "B", its1 = "C")[[reg]]
+  save_panel(pcoa_plots[[reg]], paste0("Fig2", letter, "_PCoA_adonis_", REGION_LAB[[reg]]), 6.2, 5.4)
+}
+```
+
+```{r beta-source}
+# Fig2D–H 与 FigS3A–C：研究来源方差分解 / Study-source variance decomposition.
+TAB_SRC <- file.path(SERVER_DIR, "beta", "source_tables")
+dec <- data.table::fread(file.path(TAB_SRC, "beta_source_R2_decomposition.tsv"))
+model <- data.table::fread(file.path(TAB_SRC, "beta_source_model.tsv"))
+vpa <- data.table::fread(file.path(TAB_SRC, "beta_source_vpa3.tsv"))
+struct <- data.table::fread(file.path(TAB_SRC, "beta_source_structure.tsv"))
+tests <- data.table::fread(file.path(TAB_SRC, "beta_source_tests.tsv"))
+rob <- data.table::fread(file.path(TAB_SRC, "beta_source_robustness.tsv"))
+REGS <- REGIONS3
+REG_LAB <- c(v4 = "V4", v5_v7 = "V5-V7", its1 = "ITS1")
+FAC_LAB <- c(Genus = "Host\ngenus", source = "Study\n(source)", Country = "Country", extract = "DNA\nextraction")
+FAC_COL <- c(Genus = "#D55E00", source = "#333333", Country = "#0072B2", extract = "#009E73")
+SCEN_LAB <- c(all = "All samples", drop_S54 = "Drop S54 studies", drop_largest_source = "Drop largest study")
+pct <- function(x) pmax(x * 100, 0)
+star_of <- function(p) ifelse(is.na(p), "", ifelse(p <= 0.001, "***", ifelse(p <= 0.01, "**", ifelse(p <= 0.05, "*", "ns"))))
+base_theme <- function() theme_bw(base_size = 11) + theme(panel.grid.minor = element_blank(),
+  panel.grid.major.x = element_blank(), legend.position = "top", legend.justification = "left",
+  strip.background = element_rect(fill = "grey92", colour = NA), strip.text = element_text(face = "bold"))
+
+dec_full <- dec[scope == "full" & region %in% REGS & factor %in% names(FAC_LAB)]
+p_full <- tests[test == "unique" & scope == "full" & region %in% REGS & factor %in% names(FAC_LAB), .(region, factor, P)]
+dm <- merge(dec_full, p_full, by = c("region", "factor"), all.x = TRUE)
+dm[, `:=`(total = pct(R2_total), unique = pct(R2_unique))][, unique := pmax(unique, 0)]
+dm[, total := pmax(total, unique)][, shared := total - unique]
+dm[, factor := factor(factor, levels = names(FAC_LAB))]
+dm[, region_lab := factor(REG_LAB[region], levels = REG_LAB[REGS])][, x := as.integer(factor)]
+dm[, lab := ifelse(unique < 0.05, "0", sprintf("%.1f", unique))][, lab := paste0(lab, star_of(P))]
+dm[, lab_y := total + 2.6]
+ann <- model[scope == "full" & region %in% REGS]
+ann[, `:=`(region_lab = factor(REG_LAB[region], levels = REG_LAB[REGS]),
+           lab = sprintf("full model R² = %.1f%%", pct(R2_full)))]
+ninfo <- struct[scope == "full" & region %in% REGS]
+ninfo[, `:=`(region_lab = factor(REG_LAB[region], levels = REG_LAB[REGS]),
+             lab = sprintf("n = %s · %d studies", format(n, big.mark = ","), n_study))]
+pA_region <- function(reg) {
+  d <- dm[region == reg]; a <- ann[region == reg]; nn <- ninfo[region == reg]
+  ggplot() +
+    geom_rect(data = d, aes(xmin = x - .36, xmax = x + .36, ymin = unique, ymax = total, fill = "Shared R²"), colour = "white", linewidth = .25) +
+    geom_rect(data = d, aes(xmin = x - .36, xmax = x + .36, ymin = 0, ymax = unique, fill = factor), colour = "white", linewidth = .25) +
+    geom_text(data = d, aes(x = x, y = lab_y, label = lab), size = 2.9, vjust = 0) +
+    geom_text(data = a, aes(x = 4.45, y = 77.5, label = lab), hjust = 1, size = 2.7, colour = "grey35") +
+    geom_text(data = nn, aes(x = .55, y = 77.5, label = lab), hjust = 0, size = 2.7, colour = "grey35") +
+    scale_fill_manual(values = c(FAC_COL, "Shared R²" = "#D9D9D9"),
+      breaks = c("Shared R²", names(FAC_LAB)),
+      labels = c("Shared R²", "Host genus (unique)", "Study source (unique)", "Country (unique)", "DNA extraction (unique)"), drop = FALSE) +
+    guides(fill = guide_legend(nrow = 2, byrow = TRUE)) +
+    scale_x_continuous(breaks = 1:4, labels = FAC_LAB, limits = c(.4, 4.6), expand = c(0, 0)) +
+    scale_y_continuous(limits = c(0, 80), breaks = seq(0, 80, 20), labels = function(x) paste0(x, "%"), expand = c(0, 0)) +
+    labs(x = NULL, y = "R² of Bray–Curtis variation (%)", fill = "R² component", title = REG_LAB[[reg]]) + base_theme()
+}
+for (reg in REGS) save_panel(pA_region(reg), paste0("Fig2", c(v4 = "D", v5_v7 = "E", its1 = "F")[[reg]], "_Beta_source_R2_", REG_LAB[[reg]]), 5.2, 5.2)
+
+host_full <- dec[scope == "full" & factor == "Genus" & region %in% REGS, .(region, scope_lab = "All samples", value = pct(R2_unique))]
+host_mg <- dec[scope == "mg_source" & factor == "Genus" & region %in% REGS, .(region, scope_lab = "Within studies", value = pct(R2_unique))]
+pf <- tests[test == "unique" & scope == "full" & factor == "Genus" & region %in% REGS, .(region, P_full = P)]
+pm <- tests[test == "unique" & scope == "mg_source" & factor == "Genus" & region %in% REGS, .(region, P_mg = P)]
+host <- rbind(host_full[, P := pf$P_full[match(region, pf$region)]], host_mg[, P := pm$P_mg[match(region, pm$region)]])
+host[, scope_lab := factor(scope_lab, levels = c("All samples", "Within studies"))]
+host[, region_lab := factor(REG_LAB[region], levels = REG_LAB[REGS])]
+host[, lab := paste0(ifelse(value < .05, "0", sprintf("%.1f", value)), star_of(P))][, lab_y := value + 3]
+host <- merge(host, struct[scope == "mg_source" & region %in% REGS, .(region, n_study)], by = "region", all.x = TRUE)
+annB <- host[scope_lab == "Within studies", .(x = as.integer(region_lab) + .18, y = value + 10, lab = sprintf("%d studies", n_study))]
+pG <- ggplot(host, aes(x = region_lab, y = value, fill = scope_lab)) +
+  geom_col(position = position_dodge(width = .74), width = .68) +
+  geom_text(aes(y = lab_y, label = lab, group = scope_lab), position = position_dodge(width = .74), size = 2.9, vjust = 0) +
+  geom_text(data = annB, aes(x = x, y = y, label = lab), size = 2.6, colour = "grey35", inherit.aes = FALSE) +
+  scale_fill_manual(values = c("All samples" = "#999999", "Within studies" = "#D55E00"), drop = FALSE) +
+  scale_y_continuous(limits = c(0, 90), breaks = seq(0, 80, 20), labels = function(x) paste0(x, "%"), expand = c(0, 0)) +
+  labs(x = NULL, y = "Host-genus unique R² (%)", fill = NULL) + base_theme()
+save_panel(pG, "Fig2G_Beta_source_host_genus_all_vs_within_studies", 5.2, 5)
+
+gridC <- data.table::CJ(region = REGS, scenario = c("all", "drop_S54", "drop_largest_source"))
+rb <- merge(gridC, rob[scope == "full" & factor == "Genus" & region %in% REGS, .(region, scenario, value = pct(R2_unique))], by = c("region", "scenario"), all.x = TRUE)
+rb[, `:=`(region_lab = factor(REG_LAB[region], levels = REG_LAB[REGS]),
+          scenario_lab = factor(SCEN_LAB[scenario], levels = SCEN_LAB[c("all", "drop_S54", "drop_largest_source")]))]
+rb[, lab := ifelse(is.na(value), "n/a", ifelse(value < .05, "0", sprintf("%.1f", value)))][, lab_y := ifelse(is.na(value), 1, value + 1.2)]
+pH <- ggplot(rb, aes(x = region_lab, y = value, fill = scenario_lab)) +
+  geom_col(position = position_dodge(width = .78), width = .7, na.rm = TRUE) +
+  geom_text(aes(y = lab_y, label = lab, group = scenario_lab), position = position_dodge(width = .78), size = 2.7, vjust = 0, na.rm = TRUE) +
+  scale_fill_manual(values = c("All samples" = "#333333", "Drop S54 studies" = "#0072B2", "Drop largest study" = "#D55E00"), drop = FALSE) +
+  scale_y_continuous(limits = c(0, 40), breaks = seq(0, 40, 10), labels = function(x) paste0(x, "%"), expand = c(0, 0)) +
+  labs(x = NULL, y = "Host-genus unique R² (%)", fill = NULL) + base_theme()
+save_panel(pH, "Fig2H_Beta_source_host_genus_sensitivity", 5.2, 5)
+
+FRA_LAB <- c(a = "Host unique", b = "Study unique", c = "Environment unique", d = "Host ∩ study", e = "Host ∩ environment", f = "Study ∩ environment", g = "All shared", h = "Residual")
+SEG_ORDER <- c("a", "d", "e", "b", "c", "f", "g", "h")
+SEG_COL <- c("Host unique" = "#D55E00", "Host ∩ study" = "#F4B183", "Host ∩ environment" = "#FBE3D6", "Study unique" = "#333333", "Environment unique" = "#0072B2", "Study ∩ environment" = "#999999", "All shared" = "#D9D9D9", "Residual" = "#F2F2F2")
+vp <- vpa[region %in% REGS & scope == "full" & !is.na(AdjR2)]
+vp[, code := sub("^\\[([a-h])\\].*$", "\\1", fraction)][code %in% names(FRA_LAB)]
+neg <- vp[AdjR2 < 0, .(neg_sum = -sum(AdjR2)), by = region]
+vp <- merge(vp, neg, by = "region", all.x = TRUE); vp[is.na(neg_sum), neg_sum := 0]
+vp[code == "h", AdjR2 := AdjR2 + neg_sum][, AdjR2 := pmax(AdjR2, 0), by = region][, val := pmax(AdjR2, 0) * 100]
+vp[, `:=`(region_lab = factor(REG_LAB[region], levels = REG_LAB[REGS]), seg = factor(FRA_LAB[code], levels = FRA_LAB[SEG_ORDER]))]
+data.table::setorder(vp, region_lab, seg)
+vp[, `:=`(cum = cumsum(val), x = as.integer(region_lab)), by = region_lab][, ymin := cum - val]
+lab_vp <- vp[code %in% c("a", "b") & val >= 3, .(x, y = (ymin + cum) / 2, lab = sprintf("%.1f", val))]
+pS3A <- ggplot(vp) +
+  geom_rect(aes(xmin = x - .36, xmax = x + .36, ymin = ymin, ymax = cum, fill = seg), colour = "white", linewidth = .25) +
+  geom_text(data = lab_vp, aes(x = x, y = y, label = lab), size = 2.9, colour = "grey10", fontface = "bold") +
+  scale_fill_manual(values = SEG_COL, drop = FALSE) +
+  scale_x_continuous(breaks = 1:3, labels = REG_LAB[REGS], limits = c(.4, 3.6), expand = c(0, 0)) +
+  scale_y_continuous(limits = c(0, 100), breaks = seq(0, 100, 25), labels = function(x) paste0(x, "%"), expand = c(0, 0)) +
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE)) +
+  labs(x = NULL, y = "Share of β-diversity variation (%)", fill = NULL) + base_theme()
+save_panel(pS3A, "FigS3A_Beta_source_VPA", 8, 6)
+
+gridE <- data.table::CJ(region = REGS, scenario = c("all", "drop_S54", "drop_largest_source"))
+rs <- merge(gridE, rob[scope == "full" & factor == "source" & region %in% REGS, .(region, scenario, value = pct(R2_unique))], by = c("region", "scenario"), all.x = TRUE)
+rs[, `:=`(region_lab = factor(REG_LAB[region], levels = REG_LAB[REGS]), scenario_lab = factor(SCEN_LAB[scenario], levels = SCEN_LAB[c("all", "drop_S54", "drop_largest_source")]))]
+rs[, lab := ifelse(is.na(value), "n/a", ifelse(value < .05, "0", sprintf("%.1f", value)))][, lab_y := ifelse(is.na(value), .6, value + .5)]
+pS3B <- ggplot(rs, aes(x = region_lab, y = value, fill = scenario_lab)) +
+  geom_col(position = position_dodge(width = .78), width = .7, na.rm = TRUE) +
+  geom_text(aes(y = lab_y, label = lab, group = scenario_lab), position = position_dodge(width = .78), size = 2.7, vjust = 0, na.rm = TRUE) +
+  scale_fill_manual(values = c("All samples" = "#333333", "Drop S54 studies" = "#0072B2", "Drop largest study" = "#D55E00"), drop = FALSE) +
+  scale_y_continuous(limits = c(0, 13), breaks = seq(0, 12, 3), labels = function(x) paste0(x, "%"), expand = c(0, 0)) +
+  labs(x = NULL, y = "Study-source unique R² (%)", fill = NULL) + base_theme()
+save_panel(pS3B, "FigS3B_Beta_source_unique_R2_sensitivity", 6, 5)
+
+st <- struct[region %in% REGS & scope %in% c("full", "mg_source")]
+st[, `:=`(region_lab = factor(REG_LAB[region], levels = REG_LAB[REGS]), scope_lab = factor(c(full = "All samples", mg_source = "Within studies")[scope], levels = c("All samples", "Within studies")), share = pct(largest_source_share))]
+st[, lab := sprintf("n = %d", n_study)]
+pS3C <- ggplot(st, aes(x = region_lab, y = share, fill = scope_lab)) +
+  geom_col(position = position_dodge(width = .74), width = .68) +
+  geom_text(aes(label = lab, group = scope_lab), position = position_dodge(width = .74), size = 2.7, vjust = -.3) +
+  scale_fill_manual(values = c("All samples" = "#999999", "Within studies" = "#D55E00"), drop = FALSE) +
+  scale_y_continuous(limits = c(0, 105), breaks = seq(0, 100, 25), labels = function(x) paste0(x, "%"), expand = c(0, 0)) +
+  labs(x = NULL, y = "Largest study share of samples (%)", fill = NULL) + base_theme()
+save_panel(pS3C, "FigS3C_Beta_source_study_leverage", 6, 5)
+```

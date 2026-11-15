@@ -1,0 +1,17 @@
+# Data are versioned in the associated Zenodo deposit.
+data/**
+!data/README.md
+server_result/**
+!server_result/README.md
+results/
+.Rhistory
+.RData
+.Rproj.user/
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+.env
+*token*
+.local_state/
+manuscript_tables/

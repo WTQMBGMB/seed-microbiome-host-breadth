@@ -1,0 +1,331 @@
+```{r gos-setup}
+# GOS 通才/专才章节 / Generalist-specialist chapter.
+source(file.path(PROJECT_ROOT <- normalizePath(Sys.getenv("SEED_PROJECT_ROOT", unset = getwd()), winslash = "/"), "R", "config.R"))
+source(file.path(PROJECT_ROOT, "R", "io.R"))
+source(file.path(PROJECT_ROOT, "R", "gos_core.R"))
+source(file.path(PROJECT_ROOT, "R", "sankey.R"))
+suppressMessages({library(data.table); library(ggplot2); library(dplyr); library(patchwork); library(ggtree)})
+
+GOS_TMP <- file.path(DERIVED_DIR, "gos")
+GOS_TAB <- file.path(TAB_DIR, "gos")
+GOS_FIG <- FIG_DIR
+dir.create(GOS_TMP, recursive = TRUE, showWarnings = FALSE)
+dir.create(GOS_TAB, recursive = TRUE, showWarnings = FALSE)
+HOST_TREE <- file.path(TREE_DIR, "plant_species_tree_all.nwk")
+HOST_DIST_RDS <- file.path(GOS_TMP, "host_dist.rds")
+for (f in c("host_dist.rds", "presence_merged_16s.rds", "presence_merged_its.rds",
+            "nhost_null_16s_iter1000.rds", "nhost_null_its_iter1000.rds",
+            "mpd_null_16s_rep1000.rds", "mpd_null_its_rep1000.rds",
+            "gos_threshold_16s.rds", "gos_threshold_its.rds")) {
+  src <- file.path(SERVER_DIR, "gos", f)
+  dst <- file.path(GOS_TMP, f)
+  if (!file.exists(dst)) file.copy(src, dst)
+}
+N_ITER <- 1000L; N_REP <- 1000L; ALPHA <- 0.05
+GOS_CFG <- list(
+  `16s` = list(
+    css = file.path(CSS_DIR, "merged", "css_16s_asvtab.txt"),
+    meta = file.path(DATA_DIR, "metadata", "metadata_16S.txt"),
+    ref = file.path(DATA_DIR, "filtered_merge", "16S", "Merged_16S_Silva_filtered.fa"),
+    tax = file.path(DATA_DIR, "filtered_merge", "16S", "Merged_16S_taxonomy_filtered.txt"),
+    merged_txt = file.path(GOS_TMP, "presence_merged_16s.txt"),
+    merged_rds = file.path(GOS_TMP, "presence_merged_16s.rds"),
+    merge_log = file.path(GOS_TMP, "presence_species_merge_log_16s.csv"),
+    nhost_rds = file.path(GOS_TMP, "nhost_null_16s_iter1000.rds"),
+    mpd_rds = file.path(GOS_TMP, "mpd_null_16s_rep1000.rds"),
+    info_csv = file.path(GOS_TAB, "gos_per_asv_info_16s.txt"),
+    classified = file.path(GOS_TAB, "gos_classified_16s.txt"),
+    threshold = file.path(GOS_TMP, "gos_threshold_16s.rds"),
+    gen_fa = file.path(GOS_TAB, "gos_generalist_ref_16s.fa"),
+    gen_tax = file.path(GOS_TAB, "gos_generalist_taxonomy_16s.txt"),
+    spe_fa = file.path(GOS_TAB, "gos_specialist_ref_16s.fa"),
+    spe_tax = file.path(GOS_TAB, "gos_specialist_taxonomy_16s.txt")),
+  its = list(
+    css = file.path(CSS_DIR, "merged", "css_its_asvtab.txt"),
+    meta = file.path(DATA_DIR, "metadata", "metadata_ITS.txt"),
+    ref = file.path(DATA_DIR, "filtered_merge", "ITS", "Merged_ITS_Unite_filtered.fa"),
+    tax = file.path(DATA_DIR, "filtered_merge", "ITS", "Merged_ITS_taxonomy_filtered.txt"),
+    merged_txt = file.path(GOS_TMP, "presence_merged_its.txt"),
+    merged_rds = file.path(GOS_TMP, "presence_merged_its.rds"),
+    merge_log = file.path(GOS_TMP, "presence_species_merge_log_its.csv"),
+    nhost_rds = file.path(GOS_TMP, "nhost_null_its_iter1000.rds"),
+    mpd_rds = file.path(GOS_TMP, "mpd_null_its_rep1000.rds"),
+    info_csv = file.path(GOS_TAB, "gos_per_asv_info_its.txt"),
+    classified = file.path(GOS_TAB, "gos_classified_its.txt"),
+    threshold = file.path(GOS_TMP, "gos_threshold_its.rds"),
+    gen_fa = file.path(GOS_TAB, "gos_generalist_ref_its.fa"),
+    gen_tax = file.path(GOS_TAB, "gos_generalist_taxonomy_its.txt"),
+    spe_fa = file.path(GOS_TAB, "gos_specialist_ref_its.fa"),
+    spe_tax = file.path(GOS_TAB, "gos_specialist_taxonomy_its.txt"))
+)
+gos_host_dist(HOST_TREE, HOST_DIST_RDS)
+```
+
+```{r gos-presence}
+# Step 1：0-1 矩阵 / Presence matrices.
+mg_16s <- gos_presence_merge(GOS_CFG$`16s`$css, GOS_CFG$`16s`$meta, GOS_CFG$`16s`$ref,
+  HOST_DIST_RDS, GOS_CFG$`16s`$merged_txt, GOS_CFG$`16s`$merge_log,
+  GOS_CFG$`16s`$merged_rds, "16s")
+mg_its <- gos_presence_merge(GOS_CFG$its$css, GOS_CFG$its$meta, GOS_CFG$its$ref,
+  HOST_DIST_RDS, GOS_CFG$its$merged_txt, GOS_CFG$its$merge_log,
+  GOS_CFG$its$merged_rds, "its")
+for (f in c("presence_merged_16s.txt", "presence_merged_its.txt")) {
+  if (!file.exists(file.path(GOS_TMP, f))) file.copy(file.path(SERVER_DIR, "gos", f), file.path(GOS_TMP, f))
+}
+```
+
+```{r gos-null-classify}
+# Step 2–4：n_hosts 零分布、MPD 零模型、分类 / Null models and classification.
+nnull_16s <- gos_nhost_null(GOS_CFG$`16s`$merged_rds, GOS_CFG$`16s`$nhost_rds, N_ITER, SEEDS$gos)
+nnull_its <- gos_nhost_null(GOS_CFG$its$merged_rds, GOS_CFG$its$nhost_rds, N_ITER, SEEDS$gos)
+thr_16s <- gos_nhost_threshold(nnull_16s, "16s"); saveRDS(thr_16s, GOS_CFG$`16s`$threshold)
+thr_its <- gos_nhost_threshold(nnull_its, "its"); saveRDS(thr_its, GOS_CFG$its$threshold)
+gos_mpd_null(GOS_CFG$`16s`$merged_rds, HOST_DIST_RDS, GOS_CFG$`16s`$mpd_rds, N_REP, SEEDS$gos)
+gos_mpd_null(GOS_CFG$its$merged_rds, HOST_DIST_RDS, GOS_CFG$its$mpd_rds, N_REP, SEEDS$gos)
+z16 <- gos_z_scores(GOS_CFG$`16s`$merged_rds, HOST_DIST_RDS, GOS_CFG$`16s`$mpd_rds,
+                    GOS_CFG$`16s`$info_csv, "16s")
+zit <- gos_z_scores(GOS_CFG$its$merged_rds, HOST_DIST_RDS, GOS_CFG$its$mpd_rds,
+                    GOS_CFG$its$info_csv, "its")
+cl16 <- gos_classify(z16, thr_16s$threshold, ALPHA)
+clit <- gos_classify(zit, thr_its$threshold, ALPHA)
+data.table::fwrite(cl16, GOS_CFG$`16s`$classified, sep = "\t")
+data.table::fwrite(clit, GOS_CFG$its$classified, sep = "\t")
+for (ds in c("16s", "its")) {
+  cfg <- GOS_CFG[[ds]]; cl <- if (ds == "16s") cl16 else clit
+  gos_extract_fasta(cl$ASV_ID[cl$category == "generalist"], cfg$ref, cfg$gen_fa)
+  gos_extract_fasta(cl$ASV_ID[cl$category == "specialist"], cfg$ref, cfg$spe_fa)
+  gos_extract_tax(cl$ASV_ID[cl$category == "generalist"], cfg$tax, cfg$gen_tax)
+  gos_extract_tax(cl$ASV_ID[cl$category == "specialist"], cfg$tax, cfg$spe_tax)
+}
+```
+
+```{r gos-threshold-figure}
+# FigS6A/B：n_hosts 实际 vs 零分布 / Observed versus null n_hosts.
+nhost_panel <- function(res, thr, colour, title) {
+  act <- res$actual_count; nul <- res$null_count; nit <- res$n_iter; x_max <- 50
+  ts <- 1:min(length(act) - 1L, x_max)
+  d <- rbind(data.table(n_hosts = ts, count = as.numeric(act[ts + 1L]), distribution = "Actual"),
+             data.table(n_hosts = ts, count = nul[ts + 1L] / nit, distribution = "Null (avg/iteration)"))
+  d[, y := log10(count + 1)]
+  ggplot(d, aes(n_hosts, y, fill = distribution)) +
+    geom_col(position = position_dodge(width = .8), width = .7, alpha = .85, colour = "black", linewidth = .1) +
+    geom_vline(xintercept = thr, linetype = "dashed", colour = "firebrick", linewidth = .6) +
+    scale_fill_manual(values = c(Actual = colour, `Null (avg/iteration)` = "gray65")) +
+    scale_x_continuous(limits = c(0, x_max), breaks = seq(0, x_max, 5)) +
+    labs(title = title, subtitle = sprintf("threshold = %d (dashed); %d iterations", thr, nit),
+         x = "n_hosts (number of host species)", y = "log10(Number of ASVs + 1)", fill = NULL) +
+    theme_bw(base_size = 11) + theme(panel.grid.minor = element_blank(), legend.position = "bottom")
+}
+save_panel(nhost_panel(nnull_16s, thr_16s$threshold, "#4E79A7", "16S seed microbiota"), "FigS6A_n_hosts_threshold_16S", 8, 5)
+save_panel(nhost_panel(nnull_its, thr_its$threshold, "#81B29A", "ITS seed microbiota"), "FigS6B_n_hosts_threshold_ITS", 8, 5)
+```
+
+```{r gos-dispersion}
+# FigS6C：clustered/dispersed ASV 宿主分布热图 / Host-distribution heatmap.
+gos_dispersion_heatmap(
+  classified_files = list(B = GOS_CFG$`16s`$classified, F = GOS_CFG$its$classified),
+  presence_files = list(B = GOS_CFG$`16s`$merged_txt, F = GOS_CFG$its$merged_txt),
+  tax_files = list(B = GOS_CFG$`16s`$tax, F = GOS_CFG$its$tax),
+  meta_files = list(B = GOS_CFG$`16s`$meta, F = GOS_CFG$its$meta),
+  tree_file = HOST_TREE,
+  color_map_rds = file.path(DERIVED_DIR, "color_map_flat.rds"),
+  out_selected = file.path(GOS_TAB, "gos_dispersion_selected.tsv"),
+  out_taxonomy = file.path(GOS_TAB, "gos_clustered_taxonomy_repr.tsv"),
+  out_fig_base = file.path(FIG_DIR, "FigS6C_Host_distribution_structured_ASVs"))
+```
+
+```{r gos-all-asv-tree}
+# Fig4A：全 ASV 树 + iTOL 注释 / All-ASV tree, iTOL annotation and phylosig tables.
+tree <- ape::read.tree(file.path(SERVER_DIR, "gos", "tree_16s_allASV", "all_asv_tree_itol.nwk"))
+ann <- data.table::fread(file.path(SERVER_DIR, "gos", "tree_16s_allASV", "annotation_16s_allASV.tsv"))
+ann <- ann[match(tree$tip.label, taxid)]
+ann_join <- as.data.frame(ann)
+p_tree <- ggtree::ggtree(tree, layout = "circular", size = .03) %<+% ann_join +
+  ggtree::geom_tippoint(aes(color = Phylum), size = .06, alpha = .7) +
+  ggplot2::scale_color_manual(values = colorRampPalette(RColorBrewer::brewer.pal(12, "Paired"))(length(unique(ann$Phylum))),
+                              guide = "none") +
+  ggplot2::labs(title = "All 16S ASVs: host breadth and generalist status") +
+  ggplot2::theme(legend.position = "none")
+save_panel(p_tree, "Fig4A_All_ASV_tree_host_breadth", 7, 7)
+dir.create(file.path(DERIVED_DIR, "gos", "itol_annotation"), recursive = TRUE, showWarnings = FALSE)
+file.copy(list.files(file.path(SERVER_DIR, "gos", "tree_16s_allASV", "itol_annotation"), full.names = TRUE),
+          file.path(DERIVED_DIR, "gos", "itol_annotation"), overwrite = TRUE)
+file.copy(list.files(file.path(SERVER_DIR, "gos", "tree_16s_allASV"), pattern = "^(phylosig|phyloD).*\\.tsv$", full.names = TRUE),
+          GOS_TAB, overwrite = TRUE)
+```
+
+```{r gos-sankey}
+# Fig4B 与 FigS8A：五列桑基 / Five-column Sankey from archived nodes and links.
+nodes16 <- file.path(SERVER_DIR, "gos", "precomputed", "gos_phyla_five_column_sankey_16s_nodes.tsv")
+links16 <- file.path(SERVER_DIR, "gos", "precomputed", "gos_phyla_five_column_sankey_16s_links.tsv")
+nodesit <- file.path(SERVER_DIR, "gos", "precomputed", "gos_class_five_column_sankey_its_nodes.tsv")
+linksit <- file.path(SERVER_DIR, "gos", "precomputed", "gos_class_five_column_sankey_its_links.tsv")
+phylum_map <- file.path(SERVER_DIR, "gos", "precomputed", "phylum_color_map_16s.tsv")
+assert_files(c(nodes16, links16, nodesit, linksit, phylum_map), "Sankey input")
+
+# 16S：门级颜色沿用归档 phylum_color_map_16s.tsv。
+# 16S: phylum colours follow the archived phylum_color_map_16s.tsv.
+n16 <- data.table::fread(nodes16)
+l16 <- data.table::fread(links16)
+pmap <- data.table::fread(phylum_map)
+cols16 <- stats::setNames(pmap$Color, pmap$Phylum)
+cols16[setdiff(unique(n16$Node), names(cols16))] <- "#BDBDBD"
+cols16["Other"] <- "#D9D9D9"
+save_panel(
+  draw_gos_sankey(
+    n16, l16, "Phylum", cols16,
+    title = "Phylum composition across GOS categories, Top100 host_n and NRH ASVs (16S)",
+    subtitle = paste0(
+      "Each column is normalized to 100%; top 10 phyla per category; ",
+      "thin ribbons = phyla outside the adjacent column's top 10 (pooled as Other). ",
+      "Top100 host_n = 100 highest n_hosts ASVs (overlaps G/I/S); ",
+      "NRH = no representative host, n_hosts = 0."),
+    show_legend = TRUE, legend_title = "Phylum",
+    node_border = "white", node_width = 0.32 * 1.15 * 1.10,
+    panel_margin = c(10, 150, 10, 10)),
+  "Fig4B_Phylum_composition_across_host_breadth", 14.5, 8.5)
+
+# ITS：按归档脚本的 Class 频次升序分配 PAL1 色板。
+# ITS: assign PAL1 in the archived ascending Class-frequency order.
+its_tax <- data.table::fread(GOS_CFG$its$tax)
+clit_dt <- data.table::as.data.table(clit)
+its_annot <- merge(clit_dt[, .(ASV_ID)],
+                   its_tax[, .(ASV_ID = taxid, Class)],
+                   by = "ASV_ID", all.x = TRUE)
+its_annot[is.na(Class) | Class == "", Class := "Unassigned"]
+its_glob <- its_annot[, .N, by = Class][order(-N, Class)]
+nit <- data.table::fread(nodesit)
+lit <- data.table::fread(linksit)
+its_order <- c(rev(intersect(its_glob$Class, unique(nit$Node))),
+               setdiff(unique(nit$Node), its_glob$Class))
+PAL1 <- c("#3A5A40", "#F2CC8F", "#81B29A", "#3D405B", "#F4A261",
+          "#099396", "#E7D6C2", "#547FB6", "#C5D8E7", "#BF6173",
+          "#E07A5F", "#90DBF4", "#641E16", "#A7C957", "#D35400")
+cols_it <- stats::setNames(rep(PAL1, length.out = length(its_order)), its_order)
+if ("Unassigned" %in% names(cols_it)) cols_it["Unassigned"] <- "#BDBDBD"
+save_panel(
+  draw_gos_sankey(
+    nit, lit, "Class", cols_it,
+    show_legend = FALSE, legend_title = "Class",
+    node_border = NA, node_width = 0.32 * 1.15 * 1.25 * 1.15,
+    panel_margin = c(6, 10, 6, 10)),
+  "FigS8A_Class_composition_across_host_breadth_ITS", 10, 6)
+```
+
+```{r gos-forests}
+# FigS7A–C / FigS8C–E：跨层级 HBS 森林图 / Taxon HBS forests.
+forest_plot <- function(d, rank_name, colour) {
+  d <- d[rank == rank_name & is.finite(OR) & is.finite(OR_lo) & is.finite(OR_hi)]
+  d[, taxon := factor(taxon, levels = taxon[order(OR)])]
+  ggplot(d, aes(x = OR, y = taxon)) +
+    geom_vline(xintercept = 1, linetype = "dashed", colour = "grey55") +
+    geom_pointrange(aes(xmin = OR_lo, xmax = OR_hi, colour = direction), size = .35) +
+    scale_x_log10() + scale_colour_manual(values = c(Increasing = colour, Decreasing = "#547FB6", `Not significant` = "grey55"), drop = FALSE) +
+    labs(x = "Odds ratio (host-breadth slope)", y = NULL, colour = NULL, title = rank_name) +
+    theme_bw(base_size = 10) + theme(panel.grid.minor = element_blank())
+}
+hbs16 <- fread(file.path(SERVER_DIR, "gos", "precomputed", "taxon_hbs_results_16s.tsv"))
+hbsit <- fread(file.path(SERVER_DIR, "gos", "precomputed", "taxon_hbs_results_its.tsv"))
+for (r in c("Phylum", "Order", "Genus")) {
+  letter <- c(Phylum = "A", Order = "B", Genus = "C")[[r]]
+  save_panel(forest_plot(hbs16, r, "#D55E00"), paste0("FigS7", letter, "_Taxon_HBS_", r, "_16S"), 6, 7)
+}
+for (r in c("Class", "Order", "Genus")) {
+  letter <- c(Class = "C", Order = "D", Genus = "E")[[r]]
+  save_panel(forest_plot(hbsit, r, "#D55E00"), paste0("FigS8", letter, "_Taxon_HBS_", r, "_ITS"), 6, 7)
+}
+```
+
+```{r gos-logistic-3x3}
+# Fig4C 与 FigS8B：属级 two-part 3×3 / Genus two-part encoding.
+genus_3x3 <- function(d, dataset = c("16S", "ITS")) {
+  dataset <- match.arg(dataset)
+  w <- data.table::dcast(d, Genus ~ term,
+                         value.var = c("OR", "FDR", "estimate"))
+  w <- w[is.finite(OR_x_zero) & is.finite(OR_x_pos)]
+  w[, state_zero := ifelse(
+    !is.na(FDR_x_zero) & FDR_x_zero < 0.05 & estimate_x_zero < 0, "Negative",
+    ifelse(!is.na(FDR_x_zero) & FDR_x_zero < 0.05 & estimate_x_zero > 0,
+           "Positive", "Not significant"))]
+  w[, state_pos := ifelse(
+    !is.na(FDR_x_pos) & FDR_x_pos < 0.05 & estimate_x_pos < 0, "Negative",
+    ifelse(!is.na(FDR_x_pos) & FDR_x_pos < 0.05 & estimate_x_pos > 0,
+           "Positive", "Not significant"))]
+  w[, `:=`(
+    state_zero = factor(state_zero,
+                        levels = c("Negative", "Not significant", "Positive")),
+    state_pos = factor(state_pos,
+                       levels = c("Negative", "Not significant", "Positive")))]
+  labs3 <- w[state_zero != "Not significant" |
+               state_pos != "Not significant"][
+    order(pmin(FDR_x_zero, FDR_x_pos))]
+
+  p <- ggplot(w, aes(log2(OR_x_zero), log2(OR_x_pos),
+                     colour = state_pos, shape = state_zero)) +
+    geom_hline(yintercept = 0, colour = "grey85") +
+    geom_vline(xintercept = 0, colour = "grey85") +
+    geom_point(size = if (dataset == "16S") 2.4 else 2.6,
+               alpha = 0.85, stroke = 0.4) +
+    ggrepel::geom_text_repel(
+      data = labs3, aes(label = Genus),
+      size = if (dataset == "16S") 3.12 else 2.9,
+      colour = "black", seed = 20261107, max.overlaps = Inf,
+      box.padding = 0.7, point.padding = 0.5,
+      min.segment.length = 0, force = 2,
+      max.time = 10, max.iter = 100000, show.legend = FALSE) +
+    scale_colour_manual(
+      values = c("Negative" = "#2E86C1", "Not significant" = "grey65",
+                 "Positive" = "#E67E22"),
+      name = "Host-breadth slope\n(x_pos)") +
+    scale_shape_manual(
+      values = c("Negative" = 25, "Not significant" = 16, "Positive" = 15),
+      name = "One-host association\n(x_zero)") +
+    labs(x = "log2 OR - one-host association (h=1 vs NRH)",
+         y = "log2 OR - host-breadth slope (per doubling, h >= 1)") +
+    theme_bw(base_size = if (dataset == "16S") 11 else 9) +
+    theme(panel.grid.minor = element_blank(),
+          legend.position = "right",
+          plot.title = element_text(face = "bold"))
+
+  if (dataset == "16S") {
+    p + labs(
+      title = sprintf("16S: two-part genus-host breadth associations (%d genera)",
+                      nrow(w)),
+      subtitle = paste("FDR<0.05; colour = host-breadth slope,",
+                       "shape = one-host association (3x3)"))
+  } else {
+    p + labs(
+      title = sprintf("ITS: two-part genus-host breadth (%d genera)", nrow(w)),
+      subtitle = "FDR<0.05; colour = x_pos; shape = x_zero") +
+      theme(legend.title = element_text(size = 7.5),
+            legend.text = element_text(size = 7),
+            plot.title = element_text(face = "bold", size = 10),
+            plot.subtitle = element_text(size = 7.5))
+  }
+}
+save_panel(genus_3x3(fread(file.path(SERVER_DIR, "gos", "precomputed", "genus_logistic_twopart_16s.tsv")), "16S"),
+           "Fig4C_Genus_two_part_3x3_16S", 11.25, 9)
+save_panel(genus_3x3(fread(file.path(SERVER_DIR, "gos", "precomputed", "genus_logistic_twopart_its.tsv")), "ITS"),
+           "FigS8B_Genus_two_part_3x3_ITS", 4, 3)
+```
+
+```{r gos-abundance}
+# FigS9：宿主广度 × 相对丰度 / Host breadth versus relative abundance.
+d16 <- gos_nhost_abund_data(GOS_CFG$`16s`$css, GOS_CFG$`16s`$classified, GOS_CFG$`16s`$tax, GOS_CFG$`16s`$meta, "Phylum")
+s16 <- gos_nhost_abund_rank(d16, top = 4L)
+dits <- gos_nhost_abund_data(GOS_CFG$its$css, GOS_CFG$its$classified, GOS_CFG$its$tax, GOS_CFG$its$meta, "Class")
+sits <- gos_nhost_abund_rank(dits, top = 4L)
+d16 <- d16[grp %in% s16$grp]; dits <- dits[grp %in% sits$grp]
+d16[, panel := paste("16S Phylum:", grp)]; dits[, panel := paste("ITS Class:", grp)]
+dd <- rbind(d16, dits, fill = TRUE)
+dd[, panel := factor(panel, levels = c(paste("16S Phylum:", s16$grp), paste("ITS Class:", sits$grp)))]
+p9 <- ggplot(dd, aes(n_hosts, log10_rel)) +
+  geom_point(aes(colour = log10_rel, shape = category), size = .6, alpha = .25) +
+  geom_smooth(method = "lm", formula = y ~ x, se = TRUE, colour = "black", linewidth = .6) +
+  scale_colour_gradient(low = "#93BCD0", high = "#FE816F", name = "log10 relative abundance") +
+  scale_shape_manual(values = c(generalist = 17, specialist = 15, intermediate = 16, NRH = 4), name = NULL) +
+  facet_wrap(~ panel, nrow = 2, scales = "free") +
+  labs(x = "n_hosts", y = "log10 relative abundance") +
+  theme_bw(base_size = 10) + theme(legend.position = "bottom")
+save_panel(p9, "FigS9_Abundance_host_breadth_curves", 14, 8)
+```
