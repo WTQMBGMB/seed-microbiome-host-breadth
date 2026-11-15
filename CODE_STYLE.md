@@ -47,11 +47,11 @@
 
 ## 表格 / Tables
 
-- 稿件表统一命名 `Table S1.xlsx`–`Table S6.xlsx`；代码内部历史名 `Table_S7` 不再使用。
+- 稿件表统一命名 `Table S1.xlsx`–`Table S7.xlsx`；Table S7 为审核后的预测覆盖率表，按当前文件名复制。
 - Table S1 是人工整理输入；Table S2/S3 由数据集章节生成，Table S4 由宿主系统发育章节生成，Table S5 由 GOS 分类表生成，Table S6 由 16S 性状表生成。
 
 ## 修改与验收 / Change control
 
 - 修改前备份；科学方法或结论变更须作者确认。
-- 重构后用 `scripts/tools/check_outputs.py` 检查 83 个 Subplot 是否齐全，并对关键结果表做数值对齐。
+- 重构后用 `scripts/tools/check_outputs.py` 检查 84 行图表输出清单是否齐全，并对关键结果表做数值对齐。
 - 不通过观察 JPG/TIF 判断结论；图件只检查底层数据和文件完整性。

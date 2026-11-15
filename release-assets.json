@@ -1,7 +1,7 @@
 {
   "version": "1.0.0",
-  "zenodo_record": null,
-  "status": "prepared-not-published",
+  "zenodo_record": "https://zenodo.org/records/24241936",
+  "status": "data-published-code-release-pending",
   "archives": [
     {
       "name": "seed-microbiome-inputs-v1.0.0.zip",
@@ -21,5 +21,6 @@
       "sha256": "b2b0aa230de6d2a84b5902f79fdaed5396d3a07b1a361828dac78c0cfd8ea8cf",
       "files": 197
     }
-  ]
+  ],
+  "dataset_doi": "10.5281/zenodo.24241936"
 }

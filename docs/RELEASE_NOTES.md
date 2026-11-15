@@ -9,3 +9,7 @@ from the reviewed 52-publication list; no eligible sample count changes.
 This release does not contain passwords, access tokens, editor correspondence,
 EndNote libraries or manuscript working files. Historical workstation paths may
 remain in original provenance and local-maintenance scripts.
+
+Companion processed dataset v1.0.0 is published at
+https://doi.org/10.5281/zenodo.24241936 . The software DOI will be assigned
+when the GitHub Release is archived through Zenodo.

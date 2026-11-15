@@ -47,6 +47,11 @@
       "identifier": "https://github.com/WTQMBGMB/seed-microbiome-host-breadth",
       "relation": "isSupplementTo",
       "scheme": "url"
+    },
+    {
+      "identifier": "10.5281/zenodo.24241936",
+      "relation": "requires",
+      "scheme": "doi"
     }
   ]
 }

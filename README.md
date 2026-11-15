@@ -4,10 +4,11 @@ Analysis code for **Host-associated community structure and microbial host bread
 
 ## Data and version
 
-Release candidate: v1.0.0. Code is maintained on GitHub; processed inputs,
-precomputed results and reference outputs are provided as companion Zenodo archives.
+Code version: v1.0.0 (software archive pending). Processed inputs, precomputed
+results and reference outputs are publicly archived as dataset v1.0.0:
+[doi:10.5281/zenodo.24241936](https://doi.org/10.5281/zenodo.24241936).
 The dataset record URL and archive checksums are recorded in `release-assets.json`.
-If the record is not yet set, the release is still being prepared.
+The dataset DOI identifies the data, not the software archive.
 
 The synthesis contains 5,962 marker-gene profiles (3,652 16S and 2,310 ITS),
 169 plant species and 45 countries. The literature list contains 52 eligible
@@ -25,10 +26,10 @@ The mapped 16S set contains 22,749 bacterial and 96 archaeal features.
 5. Run `Rscript -e 'rmarkdown::render("Analysis_pipeline.Rmd")'`.
 6. Run `python scripts/tools/check_outputs.py` and `python scripts/tools/validate_results.py`.
 
-Alternatively, after the record is published, use:
+Alternatively, download and extract the published data with:
 
 ```sh
-python scripts/tools/fetch_data.py --record https://zenodo.org/records/RECORD_ID
+python scripts/tools/fetch_data.py --record https://zenodo.org/records/24241936
 ```
 
 The downloader validates archive checksums and refuses unsafe ZIP paths.
