@@ -4,11 +4,13 @@ Analysis code for **Host-associated community structure and microbial host bread
 
 ## Data and version
 
-Code version: v1.0.0 (software archive pending). Processed inputs, precomputed
+Code version: v1.0.0, archived at
+[doi:10.5281/zenodo.24242501](https://doi.org/10.5281/zenodo.24242501).
+Processed inputs, precomputed
 results and reference outputs are publicly archived as dataset v1.0.0:
 [doi:10.5281/zenodo.24241936](https://doi.org/10.5281/zenodo.24241936).
 The dataset record URL and archive checksums are recorded in `release-assets.json`.
-The dataset DOI identifies the data, not the software archive.
+Use the software DOI to cite the archived code and the dataset DOI to cite the data.
 
 The synthesis contains 5,962 marker-gene profiles (3,652 16S and 2,310 ITS),
 169 plant species and 45 countries. The literature list contains 52 eligible
