@@ -1,60 +1,146 @@
-# Project-wide configuration / 项目级配置
-# Run from the github2 project root, or set SEED_PROJECT_ROOT.
+# =============================================================================
+# Project paths and run switches / 项目路径与运行开关
+#
+# All paths are resolved from the repository root.  No machine-specific or
+# server paths are allowed here. / 所有路径相对于仓库根目录，不包含本机或服务器绝对路径。
+# =============================================================================
 
 PROJECT_ROOT <- normalizePath(
-  Sys.getenv("SEED_PROJECT_ROOT", unset = getwd()),
-  winslash = "/", mustWork = TRUE
-)
-if (!file.exists(file.path(PROJECT_ROOT, "data", "MANIFEST.tsv"))) {
-  stop("Not in the github2 project root / 当前目录不是 github2 项目根目录: ", PROJECT_ROOT)
+  Sys.getenv("SEED_PROJECT_ROOT", unset = getwd()), winslash = "/", mustWork = TRUE)
+
+DATA_DIR      <- file.path(PROJECT_ROOT, "data")
+SERVER_DIR    <- file.path(PROJECT_ROOT, "server_result")
+RESULT_DIR    <- file.path(PROJECT_ROOT, "result")
+PREPARED_DIR  <- file.path(RESULT_DIR, "prepared")
+MANIFEST_DIR  <- file.path(PROJECT_ROOT, "manifests")
+
+CHAPTERS <- c("ch1_dataset", "ch2_host_effect", "ch3_phylogeny",
+              "ch4_generality", "ch5_traits")
+
+# ---- Run switches / 运行开关 -------------------------------------------------
+# SEED_RECOMPUTE: comma-separated steps (css, alphabeta, traits, all).
+# 重算指定步骤；默认读取仓库内已准备好的文件。
+RECOMPUTE_STEPS <- strsplit(tolower(Sys.getenv("SEED_RECOMPUTE", "")), ",",
+                            fixed = TRUE)[[1]]
+RECOMPUTE_STEPS <- trimws(RECOMPUTE_STEPS[nzchar(RECOMPUTE_STEPS)])
+
+want_recompute <- function(step) {
+  "all" %in% RECOMPUTE_STEPS || step %in% RECOMPUTE_STEPS
 }
 
-DATA_DIR     <- file.path(PROJECT_ROOT, "data")
-SERVER_DIR   <- file.path(PROJECT_ROOT, "server_result")
-RESULT_DIR   <- file.path(PROJECT_ROOT, "results")
-DERIVED_DIR  <- file.path(RESULT_DIR, "derived")
-CSS_DIR      <- file.path(DERIVED_DIR, "css")
-TREE_DIR     <- file.path(DERIVED_DIR, "trees")
-CKPT_DIR     <- file.path(RESULT_DIR, "checkpoints")
-FIG_DIR      <- file.path(RESULT_DIR, "figures")
-TAB_DIR      <- file.path(RESULT_DIR, "tables")
-DIAG_DIR     <- file.path(RESULT_DIR, "diagnostics")
-LOG_DIR      <- file.path(RESULT_DIR, "logs")
-for (d in c(RESULT_DIR, DERIVED_DIR, CSS_DIR, TREE_DIR, CKPT_DIR, FIG_DIR, TAB_DIR, DIAG_DIR, LOG_DIR)) {
-  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+# Server-equivalent steps are read-only unless explicitly allowed.
+# 服务器等价步骤默认只读，只有显式允许时才本地重算。
+ALLOW_SERVER_RECOMPUTE <- tolower(Sys.getenv("SEED_ALLOW_SERVER_RECOMPUTE", "false")) %in%
+  c("true", "1", "yes")
+
+SEED_NCORE <- suppressWarnings(as.integer(Sys.getenv("SEED_NCORE", "16")))
+if (is.na(SEED_NCORE) || SEED_NCORE < 1L) SEED_NCORE <- 1L
+SEED_NCORE <- min(SEED_NCORE, 16L)
+
+# ---- Directory helpers / 目录助手 -------------------------------------------
+ch_dir <- function(chapter, kind = c("figures", "tables")) {
+  match.arg(kind)
+  file.path(RESULT_DIR, chapter, kind)
 }
 
-# Threads are capped at 16 for every local or optional server-style step.
-detected <- suppressWarnings(parallel::detectCores(logical = TRUE))
-if (is.na(detected) || detected < 1L) detected <- 1L
-N_CORES <- max(1L, min(16L, as.integer(Sys.getenv("SEED_THREADS", unset = "16")), detected))
-data.table::setDTthreads(N_CORES)
-Sys.setenv(OMP_NUM_THREADS = N_CORES, OPENBLAS_NUM_THREADS = N_CORES,
-           MKL_NUM_THREADS = N_CORES)
-options(mc.cores = N_CORES)
-
-# Recompute flags: empty = reuse checkpoints; "all" or comma-separated step names.
-RECOMPUTE <- trimws(strsplit(Sys.getenv("SEED_RECOMPUTE", unset = ""), ",")[[1]])
-RECOMPUTE <- RECOMPUTE[nzchar(RECOMPUTE)]
-recompute_step <- function(step) {
-  identical(tolower(step), "all") || "all" %in% RECOMPUTE || step %in% RECOMPUTE
+int_dir <- function(chapter = NULL, shared = FALSE) {
+  if (shared) file.path(RESULT_DIR, "intermediate", "shared")
+  else file.path(RESULT_DIR, "intermediate", chapter)
 }
-ALLOW_SERVER_RECOMPUTE <- identical(tolower(Sys.getenv("ALLOW_SERVER_RECOMPUTE", "false")), "true")
 
-# Approved analysis constants and seeds / 已批准的分析常数与种子
-REGIONS_ALL <- c("v3_v4", "v4", "v5_v6", "v5_v7", "its1", "its2")
-REGIONS3    <- c("v4", "v5_v7", "its1")
-REGION_LABEL <- c(v4 = "V4", v5_v7 = "V5-V7", its1 = "ITS1", v3_v4 = "V3-V4",
-                  v5_v6 = "V5-V6", its2 = "ITS2")
-REGION_LAB  <- REGION_LABEL
-SEEDS <- list(
-  phylo_permutation = 20261106L,
-  phylo_bootstrap   = 123L,
-  gos                = 20260813L,
-  sensitivity        = 20261110L,
-  bnti               = 12345L,
-  beta_conditional   = 20261110L
-)
-GOS_ALPHA <- 0.05
-GOS_N_ITER <- 1000L
-GOS_N_REP <- 1000L
+rds_dir <- function(chapter = NULL, shared = FALSE) {
+  if (shared) file.path(RESULT_DIR, "rds", "shared")
+  else file.path(RESULT_DIR, "rds", chapter)
+}
+
+log_dir <- function(chapter) file.path(RESULT_DIR, "logs", chapter)
+
+tree_dir <- function(chapter) file.path(RESULT_DIR, chapter, "tree")
+
+ensure_v2_dirs <- function() {
+  for (ch in CHAPTERS) {
+    for (d in c(ch_dir(ch, "figures"), ch_dir(ch, "tables"),
+                int_dir(ch), rds_dir(ch), log_dir(ch), tree_dir(ch))) {
+      if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+    }
+  }
+  for (d in c(int_dir(shared = TRUE), rds_dir(shared = TRUE), PREPARED_DIR)) {
+    if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+  }
+  invisible(TRUE)
+}
+
+# ---- Input resolution / 输入路径解析 ----------------------------------------
+# Prepared tables live either in data/ (shipped with the repository) or in
+# result/prepared/ (regenerated when the shipped copy is absent).
+# 优先使用随仓库提供的表；缺失时使用重算结果。
+first_existing <- function(paths, what) {
+  hit <- paths[file.exists(paths)]
+  if (!length(hit)) {
+    stop(paste0(
+      what, " not found. Expected one of:\n  ",
+      paste(paths, collapse = "\n  "),
+      "\nRun 00_preprocessing.Rmd or provide the file.\n",
+      what, " 未找到；请运行预处理或补充文件。"), call. = FALSE)
+  }
+  normalizePath(hit[1], winslash = "/", mustWork = TRUE)
+}
+
+# When a step is explicitly recomputed, the regenerated copy is preferred.
+# 显式重算时优先使用 result/prepared 下的新副本。
+css_merged_path <- function(file) {
+  a <- file.path(DATA_DIR, "standard_merge", file)
+  b <- file.path(PREPARED_DIR, "standard_merge", file)
+  first_existing(if (want_recompute("css")) c(b, a) else c(a, b),
+                 paste("merged CSS table", file))
+}
+
+css_region_path <- function(region, file) {
+  a <- file.path(DATA_DIR, "standard_region", region, file)
+  b <- file.path(PREPARED_DIR, "standard_region", region, file)
+  first_existing(if (want_recompute("css")) c(b, a) else c(a, b),
+                 paste("region CSS table", region, file))
+}
+
+host_tree_path <- function(file) {
+  first_existing(c(file.path(DATA_DIR, "plant_tree", file),
+                   file.path(PREPARED_DIR, "plant_tree", file)),
+                 paste("host tree", file))
+}
+
+precomp_candidates <- function(file, step) {
+  a <- file.path(DATA_DIR, "precomputed", file)
+  b <- file.path(PREPARED_DIR, "precomputed", file)
+  if (want_recompute(step)) c(b, a) else c(a, b)
+}
+
+precomp_path <- function(file, step) {
+  first_existing(precomp_candidates(file, step),
+                 paste("precomputed file", file))
+}
+
+# Beta distances are server results; alpha caches remain local precomputed.
+# β 距离为服务器结果；alpha 缓存仍属本地预计算。
+bray_path <- function(region) {
+  file <- sprintf("bray_dist_%s.rds", region)
+  srv <- server_path("ch2", "beta", file)
+  dat <- file.path(DATA_DIR, "precomputed", file)
+  pre <- file.path(PREPARED_DIR, "precomputed", file)
+  first_existing(if (want_recompute("alphabeta")) c(pre, srv, dat)
+                 else c(srv, dat, pre),
+                 paste("Bray-Curtis distance", region))
+}
+
+server_path <- function(...) file.path(SERVER_DIR, ...)
+
+meta_path <- function(dataset) {
+  first_existing(file.path(DATA_DIR, "metadata", sprintf("metadata_%s.txt", dataset)),
+                 paste("metadata", dataset))
+}
+
+require_server <- function(path, script_hint, what = basename(path)) {
+  if (file.exists(path)) return(normalizePath(path, winslash = "/", mustWork = TRUE))
+  stop(sprintf(
+    "Server result '%s' is missing.\n%s\nProvide the file under server_result/ or run scripts/server/%s with SEED_ALLOW_SERVER_RECOMPUTE=true.\n服务器结果缺失：%s；请补充 server_result/ 文件，或按提示运行服务器脚本。",
+    what, path, script_hint, what), call. = FALSE)
+}

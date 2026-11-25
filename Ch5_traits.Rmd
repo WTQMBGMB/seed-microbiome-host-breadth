@@ -1,0 +1,1377 @@
+---
+title: "Chapter 5 - Microbial traits associated with host breadth"
+output:
+  html_document:
+    toc: false
+    self_contained: false
+params:
+  force_recompute: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = TRUE, warning = TRUE,
+  fig.show = "hide", comment = "#>"
+)
+source(file.path(normalizePath(getwd(), winslash = "/"), "R", "config.R"))
+source(file.path(PROJECT_ROOT, "R", "common.R"))
+source(file.path(PROJECT_ROOT, "R", "preprocess.R"))
+suppressMessages({
+  library(data.table)
+  library(ggplot2)
+  library(ggrepel)
+  library(patchwork)
+  library(grid)
+  library(scales)
+})
+ensure_v2_dirs()
+CHAPTER <- "ch5_traits"
+FORCE <- isTRUE(params$force_recompute)
+progress <- make_progress(CHAPTER)
+```
+
+# 1. Data / 数据
+
+Chapter 5 tests whether microbial traits are associated with **host breadth
+(HB)**, using the same genus-level host-breadth values computed in Chapter 4
+(`N` host genera per ASV; NRH = 0). All trait tests are HBS-only: the
+one-host/NRH contrast (OHA) is not used. Only ASVs with `host_breadth >= 1` enter
+the models, so each effect is the change in trait prevalence per doubling of
+host breadth among host-associated ASVs.
+
+Inputs are the per-ASV 16S trait tables (FAPROTAX2, BugBase and metaTraits), the
+PICRUSt2 KO presence matrix, and the Chapter 4 host-breadth tables. Per-pool host breadth is taken directly from
+`Tab_4_asv_classification.tsv`, i.e. an ASV's host breadth recomputed within that
+qualified pool's representative presence matrix.
+
+```{r data}
+KO_FILE <- file.path(DATA_DIR, "function_prediction", "ko_data_nsti_filtered.txt")
+KO_LEVEL_FILE <- file.path(DATA_DIR, "db", "ko_level_table.txt")
+PGPG_FILE <- file.path(DATA_DIR, "db", "ko_pgpg_levels.txt")
+
+# Chapter 4 host breadth (merged) and qualified pool definitions
+hb_merged <- list(`16S` = fread(file.path(
+  ch_dir("ch4_generality", "tables"), "Tab_4_gos_merged_16s.tsv")))
+
+# Trait table: shipped with the repository; if absent (or SEED_RECOMPUTE=traits),
+# rebuild from the raw annotations and the Chapter 4 ASV universe.
+# 性状表默认读取随仓库文件；缺失或指定重算时，用原始注释与 Ch4 ASV 集重建。
+trait_candidates <- precomp_candidates("taxonomy_16s_traits.txt", "traits")
+trait_file <- if (!want_recompute("traits")) {
+  hit <- trait_candidates[file.exists(trait_candidates)]
+  if (length(hit)) hit[1] else NA_character_
+} else NA_character_
+if (is.na(trait_file)) {
+  tr16 <- build_trait_table(hb_merged[["16S"]]$ASV_ID)
+  trait_file <- file.path(PREPARED_DIR, "precomputed", "taxonomy_16s_traits.txt")
+  dir.create(dirname(trait_file), recursive = TRUE, showWarnings = FALSE)
+  data.table::fwrite(tr16, trait_file, sep = "\t", na = "NA")
+}
+tr <- list(`16S` = data.table::fread(trait_file, sep = "\t",
+                                     na.strings = c("NA", ""),
+                                     check.names = FALSE))
+stopifnot(!anyDuplicated(tr[["16S"]]$taxid))
+
+pool_summary <- fread(file.path(ch_dir("ch4_generality", "tables"),
+                                "Tab_4_pool_summary.tsv"))
+pools16 <- pool_summary[kingdom == "16S" & included == TRUE]
+pools16[, grain := factor(grain,
+                          levels = c("Coarse A", "Coarse B", "Medium", "Fine"))]
+setorder(pools16, grain, pool)
+POOLS16 <- pools16$pool
+
+# Per-pool host breadth, long table (all ASVs x all qualified 16S pools)
+cls_pool <- fread(file.path(ch_dir("ch4_generality", "tables"),
+                            "Tab_4_asv_classification.tsv"))
+cls_pool <- cls_pool[kingdom == "16S" & pool %in% POOLS16]
+stopifnot(nrow(cls_pool) == nrow(tr[["16S"]]) * length(POOLS16))
+cls_list <- split(cls_pool, by = "pool")
+hb_pools <- lapply(cls_list, function(x) {
+  x$host_breadth[match(tr[["16S"]]$taxid, x$ASV_ID)]
+})
+stopifnot(all(vapply(hb_pools, length, integer(1)) == nrow(tr[["16S"]])))
+
+hb16  <- setNames(hb_merged[["16S"]]$host_breadth[match(
+  tr[["16S"]]$taxid, hb_merged[["16S"]]$ASV_ID)], tr[["16S"]]$taxid)
+stopifnot(!anyNA(hb16))
+
+cat(sprintf("16S ASV: %d (%d with HB>=1)\n",
+            nrow(tr[["16S"]]), sum(hb16 >= 1)))
+cat(sprintf("qualified 16S pools: %d\n", length(POOLS16)))
+```
+
+# 2. Shared helpers / 公共函数
+
+## 2.1 Trait classification / 性状分类
+
+Traits are split into boolean (TRUE/FALSE) and numeric columns after removing
+metadata and the two BugBase categorical fields (`Aerobic_type`, `Gram_type`),
+which are one-hot encoded by their component booleans. `flag` encodes why a
+trait was not tested; only `flag == "ok"` traits receive FDR values and enter
+figures.
+
+```{r helpers-traits}
+META_TR <- c("taxid", "Kingdom", "Phylum", "Class", "Order", "Family", "Genus",
+             "Species", "Sub_Species", "n_hosts", "mean_dist", "dispersion",
+             "category")
+EXCL16 <- c("bugbase_ggid", "bugbase_Aerobic_type", "bugbase_Gram_type")
+
+to_logical <- function(x) {
+  y <- rep(NA, length(x))
+  y[x == "TRUE" | x == TRUE] <- TRUE
+  y[x == "FALSE" | x == FALSE] <- FALSE
+  y
+}
+is_bool_col <- function(x) {
+  v <- as.character(x[!is.na(x)])
+  v <- v[v != ""]
+  length(v) > 0 && all(v %in% c("TRUE", "FALSE"))
+}
+classify_traits <- function(d, cols) {
+  bool <- cols[vapply(cols, function(tc) is_bool_col(d[[tc]]), logical(1))]
+  rest <- setdiff(cols, bool)
+  num <- rest[vapply(rest, function(tc) {
+    x <- suppressWarnings(as.numeric(d[[tc]]))
+    !all(is.na(x))
+  }, logical(1))]
+  list(boolean = bool, numeric = num, other = setdiff(rest, num))
+}
+trait_source <- function(x) {
+  ifelse(grepl("^bugbase_", x), "BugBase",
+    ifelse(grepl("^faprotax_", x), "FAPROTAX2",
+      ifelse(grepl("^metatraits_", x), "MetaTraits", "Other")))
+}
+short_label <- function(x) {
+  y <- sub("^(bugbase|faprotax|metatraits)_", "", x)
+  y <- gsub("\\.\\.", " | ", y)
+  y <- gsub("\\.", " ", y)
+  y <- gsub("_", " ", y)
+  y <- sub("^enzyme activity \\| ", "", y)
+  y <- sub(" \\| EC.*$", "", y)
+  y <- sub("^growth \\| ", "", y)
+  y <- gsub("\\s+", " ", y)
+  y <- trimws(y)
+  ifelse(nchar(y) > 34, paste0(substr(y, 1, 31), "..."), y)
+}
+
+cols16 <- setdiff(names(tr[["16S"]]), c(META_TR, EXCL16))
+cls16  <- classify_traits(tr[["16S"]], cols16)
+BOOL16 <- cls16$boolean
+NUM16  <- cls16$numeric
+cat(sprintf("16S: %d boolean, %d numeric, %d other\n",
+            length(BOOL16), length(NUM16), length(cls16$other)))
+if (length(cls16$other)) cat("16S other columns:", paste(cls16$other, collapse = ", "), "\n")
+```
+
+## 2.2 Boolean and numeric tests / 布尔与数值检验
+
+A boolean trait is modelled as `glm(y ~ log2(host_breadth), binomial)` on
+annotated ASVs with `host_breadth >= 1`; the slope is the log2 OR per doubling
+of host breadth. A trait is estimable when at least 100 ASVs are annotated and
+each outcome class has at least 20 ASVs. BH correction is applied within trait
+source (FAPROTAX2 / BugBase / MetaTraits) so that each annotation family forms
+its own testing family.
+
+Numeric traits use Spearman rho against host breadth over the same ASV set
+(annotated, HB >= 1, at least 100 ASVs); BH is applied across the 15 metaTraits
+columns.
+
+```{r helpers-tests}
+fit_boolean <- function(y, h, min_n = 100L, min_events = 20L) {
+  ok <- !is.na(y) & !is.na(h) & h >= 1
+  n <- sum(ok)
+  if (n < min_n) {
+    return(data.table(n = n, n_true = NA_integer_, prevalence = NA_real_,
+                      log2OR = NA_real_, se = NA_real_, p = NA_real_,
+                      flag = "n_annot_lt_100"))
+  }
+  yb <- as.integer(y[ok]); hh <- h[ok]
+  nt <- sum(yb == 1L)
+  if (min(nt, n - nt) < min_events) {
+    return(data.table(n = n, n_true = nt, prevalence = nt / n,
+                      log2OR = NA_real_, se = NA_real_, p = NA_real_,
+                      flag = "events_lt_20"))
+  }
+  m <- tryCatch(suppressWarnings(glm(yb ~ log2(hh), family = binomial())),
+                error = function(e) NULL)
+  if (is.null(m)) {
+    return(data.table(n = n, n_true = nt, prevalence = nt / n,
+                      log2OR = NA_real_, se = NA_real_, p = NA_real_,
+                      flag = "fit_failed"))
+  }
+  cf <- coef(summary(m))
+  if (!"log2(hh)" %in% rownames(cf) || !is.finite(cf["log2(hh)", "Estimate"])) {
+    return(data.table(n = n, n_true = nt, prevalence = nt / n,
+                      log2OR = NA_real_, se = NA_real_,
+                      p = if ("log2(hh)" %in% rownames(cf))
+                        cf["log2(hh)", 4] else NA_real_,
+                      flag = "not_estimable"))
+  }
+  est <- cf["log2(hh)", "Estimate"]; se <- cf["log2(hh)", "Std. Error"]
+  data.table(n = n, n_true = nt, prevalence = nt / n,
+             log2OR = est, se = se, p = cf["log2(hh)", 4], flag = "ok")
+}
+
+run_boolean <- function(d, traits, h, min_n = 100L, min_events = 20L) {
+  r <- rbindlist(lapply(traits, function(tc) {
+    y <- to_logical(d[[tc]][match(names(h), d$taxid)])
+    cbind(data.table(trait = tc, source = trait_source(tc)),
+          fit_boolean(y, h, min_n, min_events))
+  }), fill = TRUE)
+  r[, `:=`(OR    = exp(log2OR),
+           OR_lo = exp(log2OR - 1.96 * se),
+           OR_hi = exp(log2OR + 1.96 * se))]
+  r[, FDR := NA_real_]
+  r[flag == "ok", FDR := p.adjust(p, method = "BH"), by = source]
+  r[, state := fcase(
+    flag != "ok", "Not estimable",
+    FDR < 0.05 & log2OR > 0, "Positive",
+    FDR < 0.05 & log2OR < 0, "Negative",
+    default = "Not significant")]
+  r[]
+}
+
+fit_numeric <- function(x, h, min_n = 100L) {
+  ok <- !is.na(x) & !is.na(h) & h >= 1
+  n <- sum(ok)
+  if (n < min_n || uniqueN(h[ok]) < 3L) {
+    return(data.table(n = n, rho = NA_real_, p = NA_real_,
+                      flag = "n_annot_lt_100"))
+  }
+  ct <- tryCatch(cor.test(x[ok], h[ok], method = "spearman", exact = FALSE),
+                 error = function(e) NULL)
+  if (is.null(ct)) {
+    return(data.table(n = n, rho = NA_real_, p = NA_real_, flag = "fit_failed"))
+  }
+  data.table(n = n, rho = unname(ct$estimate), p = ct$p.value, flag = "ok")
+}
+
+run_numeric <- function(d, traits, h) {
+  r <- rbindlist(lapply(traits, function(tc) {
+    x <- suppressWarnings(as.numeric(d[[tc]][match(names(h), d$taxid)]))
+    cbind(data.table(trait = tc, source = trait_source(tc)),
+          fit_numeric(x, h))
+  }), fill = TRUE)
+  r[, FDR := NA_real_]
+  r[flag == "ok", FDR := p.adjust(p, method = "BH")]
+  r[, state := fcase(
+    flag != "ok", "Not estimable",
+    FDR < 0.05 & rho > 0, "Positive",
+    FDR < 0.05 & rho < 0, "Negative",
+    default = "Not significant")]
+  r[]
+}
+```
+
+## 2.3 KO presence test / KO 存在性检验
+
+The PICRUSt2 matrix is converted to presence/absence (`count > 0`). Because the
+only covariate is `log2(host_breadth)`, ASVs with the same host breadth are
+interchangeable: per-KO presence counts are aggregated within each host-breadth
+value and a binomial logistic model is fitted by vectorised IRLS, which is
+numerically identical to an ASV-level `glm` and much faster across ~10,000 KOs.
+The p value is a likelihood-ratio test (df = 1). A KO is estimable when both
+presence and absence have at least 20 ASVs within the analysed pool (`min_events`).
+BH is applied across KOs within a pool.
+
+```{r helpers-ko}
+ko_fit <- function(cnt, nb, bins, ko_names, min_events = 20L) {
+  N <- sum(nb)
+  n1 <- colSums(cnt)
+  keep <- n1 >= min_events & (N - n1) >= min_events
+  if (!any(keep)) return(NULL)
+  K <- cnt[, keep, drop = FALSE]
+  ko <- ko_names[keep]
+  M <- ncol(K)
+  x <- log2(bins)
+  X <- cbind(1, x)
+  Nm <- matrix(rep(nb, M), nrow = length(nb))
+  nt <- colSums(K)
+  B <- rbind(qlogis(nt / N), rep(0, M))
+  conv <- rep(FALSE, M)
+  s0 <- s1 <- s2 <- det <- NULL
+  for (it in 1:60) {
+    L <- X %*% B
+    L[L > 30] <- 30; L[L < -30] <- -30
+    P <- plogis(L)
+    R <- K - Nm * P
+    W <- Nm * P * (1 - P) + 1e-12
+    s0 <- colSums(W); s1 <- colSums(x * W); s2 <- colSums(x * x * W)
+    S1 <- colSums(R); S2 <- colSums(x * R)
+    det <- s0 * s2 - s1^2
+    db0 <- (s2 * S1 - s1 * S2) / det
+    db1 <- (-s1 * S1 + s0 * S2) / det
+    B[1, ] <- B[1, ] + db0
+    B[2, ] <- B[2, ] + db1
+    conv <- abs(db0) < 1e-8 & abs(db1) < 1e-8
+    if (all(conv)) break
+  }
+  beta <- B[2, ]
+  se <- sqrt(s0 / det)
+  P <- plogis(pmin(pmax(X %*% B, -30), 30))
+  Pc <- pmin(pmax(P, 1e-10), 1 - 1e-10)
+  dev_full <- -2 * colSums(K * log(Pc) + (Nm - K) * log(1 - Pc))
+  ph <- pmin(pmax(nt / N, 1e-10), 1 - 1e-10)
+  dev_null <- -2 * (nt * log(ph) + (N - nt) * log(1 - ph))
+  p <- pchisq(dev_null - dev_full, df = 1, lower.tail = FALSE)
+  r <- data.table(KO = ko, n = N, n_present = as.integer(nt),
+                  prevalence = nt / N,
+                  log2OR = beta, se = se, p = p,
+                  converged = conv)
+  r[, `:=`(OR    = exp(log2OR),
+           OR_lo = exp(log2OR - 1.96 * se),
+           OR_hi = exp(log2OR + 1.96 * se))]
+  r[, near_sep := abs(log2OR) > 15]
+  r[!converged | near_sep, `:=`(OR = NA_real_, OR_lo = NA_real_,
+                                OR_hi = NA_real_)]
+  r[, flag := fifelse(!converged, "not_converged",
+                      fifelse(near_sep, "near_separation", "ok"))]
+  r[, FDR := p.adjust(p, method = "BH")]
+  r[, state := fcase(
+    flag != "ok", "Not estimable",
+    FDR < 0.05 & log2OR > 0, "Positive",
+    FDR < 0.05 & log2OR < 0, "Negative",
+    default = "Not significant")]
+  r[]
+}
+
+KO_STATE <- new.env(parent = emptyenv())
+get_ko_matrix <- function(force = FALSE) {
+  if (!is.null(KO_STATE$mat) && !force) return(KO_STATE)
+  f <- file.path(rds_dir(CHAPTER), "ko_presence.rds")
+  if (file.exists(f) && !force) {
+    progress("read cached KO presence matrix")
+    obj <- readRDS(f)
+    KO_STATE$ids <- obj$ids
+    KO_STATE$mat <- obj$mat
+  } else {
+    progress("reading PICRUSt2 KO matrix (this is the slow part)")
+    d <- fread(KO_FILE, sep = "\t", header = TRUE,
+               check.names = FALSE, na.strings = c("NA", ""))
+    ids <- as.character(d[[1L]])
+    m <- as.matrix(d[, -1L])
+    rm(d); invisible(gc())
+    if (anyNA(m)) m[is.na(m)] <- 0
+    m <- m > 0
+    KO_STATE$ids <- ids
+    KO_STATE$mat <- m
+    saveRDS(list(ids = ids, mat = m), f)
+    progress(sprintf("KO matrix saved: %d ASVs x %d KOs", nrow(m), ncol(m)))
+  }
+  KO_STATE$ko <- colnames(KO_STATE$mat)
+  KO_STATE
+}
+
+ko_test_set <- function(obj, asv_ids, h_by_asv, min_events = 20L) {
+  h <- h_by_asv[match(obj$ids, asv_ids)]
+  ok <- !is.na(h) & h >= 1
+  if (sum(ok) < 100L) return(NULL)
+  hh <- h[ok]
+  bins <- sort(unique(hh))
+  gi <- match(hh, bins)
+  nb <- tabulate(gi, nbins = length(bins))
+  cnt <- rowsum(obj$mat[ok, , drop = FALSE] + 0L, gi, reorder = TRUE)
+  ko_fit(cnt, nb, bins, obj$ko, min_events = min_events)
+}
+```
+
+# 3. Merged analysis / 合并分析
+
+Host breadth across all qualified genera of a kingdom (Chapter 4, main
+analysis). The 16S merged analysis covers 118 boolean traits, 15 numeric traits
+and the PICRUSt2 KOs.
+
+```{r merged-traits}
+CACHE_TR <- file.path(rds_dir(CHAPTER), "trait_merged.rds")
+if (file.exists(CACHE_TR) && !FORCE) {
+  merged_tr <- readRDS(CACHE_TR)
+  progress("loaded merged trait cache")
+} else {
+  progress("merged traits: 16S boolean")
+  bool16_merged <- run_boolean(tr[["16S"]], BOOL16, hb16)
+  progress("merged traits: 16S numeric")
+  num16_merged <- run_numeric(tr[["16S"]], NUM16, hb16)
+  merged_tr <- list(boolean = bool16_merged, numeric = num16_merged)
+  saveRDS(merged_tr, CACHE_TR)
+}
+bool16_merged <- merged_tr$boolean
+num16_merged  <- merged_tr$numeric
+
+cat(sprintf("16S boolean: %d tested, %d FDR<0.05 (%d pos, %d neg)\n",
+            sum(bool16_merged$flag == "ok"),
+            sum(bool16_merged$FDR < 0.05, na.rm = TRUE),
+            sum(bool16_merged$FDR < 0.05 & bool16_merged$log2OR > 0, na.rm = TRUE),
+            sum(bool16_merged$FDR < 0.05 & bool16_merged$log2OR < 0, na.rm = TRUE)))
+cat(sprintf("16S numeric: %d tested, %d FDR<0.05\n",
+            sum(num16_merged$flag == "ok"),
+            sum(num16_merged$FDR < 0.05, na.rm = TRUE)))
+```
+
+```{r merged-ko}
+CACHE_KO <- file.path(rds_dir(CHAPTER), "ko_merged.rds")
+if (file.exists(CACHE_KO) && !FORCE) {
+  ko_merged <- readRDS(CACHE_KO)
+  progress("loaded merged KO cache")
+} else {
+  obj <- get_ko_matrix()
+  progress(sprintf("merged KO: %d ASVs x %d KOs", nrow(obj$mat), ncol(obj$mat)))
+  ko_merged <- ko_test_set(obj, tr[["16S"]]$taxid, hb16, min_events = 1L)
+  saveRDS(ko_merged, CACHE_KO)
+  progress("merged KO done")
+}
+cat(sprintf("KO merged: %d tested, %d FDR<0.05 (%d pos, %d neg); %d not converged\n",
+            nrow(ko_merged), sum(ko_merged$FDR < 0.05),
+            sum(ko_merged$FDR < 0.05 & ko_merged$log2OR > 0),
+            sum(ko_merged$FDR < 0.05 & ko_merged$log2OR < 0),
+            sum(ko_merged$flag != "ok")))
+```
+
+# 4. Pool-wise analysis / 分池分析
+
+Each of the 7 qualified 16S pools (Coarse A, Coarse B and Medium; the
+region-level grain is not analysed, see Chapter 4) is re-analysed with its own
+host-breadth values. A trait must have at least 100 annotated ASVs with
+`host_breadth >= 1`
+and at least 20 ASVs in each outcome class; KOs use the same 20/20 rule. FDR is
+computed within pool (and within trait source for the boolean traits). Pools are
+not pooled statistically; cross-pool summaries only compare signs and
+significance.
+
+```{r pools-traits}
+CACHE_TP <- file.path(rds_dir(CHAPTER), "trait_pools.rds")
+if (file.exists(CACHE_TP) && !FORCE) {
+  trait_pools <- readRDS(CACHE_TP)
+  progress("loaded pool trait cache")
+} else {
+  bl <- list(); nl <- list()
+  for (pool_id in POOLS16) {
+    h <- setNames(hb_pools[[pool_id]], tr[["16S"]]$taxid)
+    bl[[pool_id]] <- run_boolean(tr[["16S"]], BOOL16, h)[, pool := pool_id]
+    nl[[pool_id]] <- run_numeric(tr[["16S"]], NUM16, h)[, pool := pool_id]
+    progress(sprintf("pool traits %s done", pool_id))
+  }
+  trait_pools <- list(boolean = rbindlist(bl, fill = TRUE),
+                      numeric = rbindlist(nl, fill = TRUE))
+  trait_pools$boolean <- merge(
+    trait_pools$boolean,
+    pools16[, .(pool, grain = as.character(grain))], by = "pool", all.x = TRUE)
+  trait_pools$numeric <- merge(
+    trait_pools$numeric,
+    pools16[, .(pool, grain = as.character(grain))], by = "pool", all.x = TRUE)
+  saveRDS(trait_pools, CACHE_TP)
+}
+# Per-pool results are unchanged by retaining only the analysis pools.
+# 仅保留纳入分析的池，单池结果不变。
+trait_pools$boolean <- trait_pools$boolean[pool %in% POOLS16]
+trait_pools$numeric <- trait_pools$numeric[pool %in% POOLS16]
+pool_bool <- trait_pools$boolean
+pool_num  <- trait_pools$numeric
+cat(sprintf("pool boolean: %d rows; %d pool-trait pairs estimable\n",
+            nrow(pool_bool), sum(pool_bool$flag == "ok")))
+cat(sprintf("pool numeric: %d rows; %d pool-trait pairs estimable\n",
+            nrow(pool_num), sum(pool_num$flag == "ok")))
+```
+
+```{r pools-ko}
+CACHE_KP <- file.path(rds_dir(CHAPTER), "ko_pools.rds")
+if (file.exists(CACHE_KP) && !FORCE) {
+  ko_pools <- readRDS(CACHE_KP)
+  progress("loaded pool KO cache")
+} else {
+  obj <- get_ko_matrix()
+  ko_pools <- list()
+  for (pool_id in POOLS16) {
+    h <- setNames(hb_pools[[pool_id]], tr[["16S"]]$taxid)
+    ko_pools[[pool_id]] <- ko_test_set(obj, tr[["16S"]]$taxid, h,
+                                       min_events = 20L)[, pool := pool_id]
+    progress(sprintf("pool KO %s done", pool_id))
+  }
+  saveRDS(ko_pools, CACHE_KP)
+}
+# Per-pool KO fits are independent; retain the Chapter 4 analysis pools.
+# 单池 KO 拟合相互独立，仅保留第四章纳入分析的池。
+ko_pools <- ko_pools[intersect(POOLS16, names(ko_pools))]
+ko_pool <- rbindlist(ko_pools, fill = TRUE)
+ko_pool <- merge(ko_pool,
+                 pools16[, .(pool, grain = as.character(grain))],
+                 by = "pool", all.x = TRUE)
+for (pool_id in POOLS16) {
+  d <- ko_pool[pool == pool_id]
+  cat(sprintf("%-22s tested=%5d  FDR<0.05=%4d (pos %3d / neg %3d)\n",
+              pool_id, nrow(d), sum(d$FDR < 0.05, na.rm = TRUE),
+              sum(d$FDR < 0.05 & d$log2OR > 0, na.rm = TRUE),
+              sum(d$FDR < 0.05 & d$log2OR < 0, na.rm = TRUE)))
+}
+# release the large logical matrix once both KO sections are done
+if (!is.null(KO_STATE$mat)) {
+  rm(list = ls(KO_STATE), envir = KO_STATE)
+  invisible(gc())
+}
+```
+
+# 5. KO annotation and cross-pool KOs / KO 注释与跨池 KO
+
+KEGG level-2 and PGPG level-3 labels are attached to each KO for the result
+tables and the sankey views. A KO can map to several KEGG pathways and several
+PGPG terms; the first annotation in file order is stored so that every KO
+contributes one count (no double counting).
+
+For the classification figure the KOs are grouped against the merged analysis
+and the two seed/germ pools. Because the merged analysis aggregates all samples,
+the two concordant sets are nested in the merged sets: a **Seed+ & Germ+** KO is
+significant with a positive slope in the merged analysis and in both the Seed
+and Germ pools (three-way concordance), and a **Seed- & Germ-** KO is significant
+with a negative slope in all three. Every other KO is described by its merged
+status alone (Merged+, Merged- or Merged NS). KOs whose merged fit did not
+converge are excluded. The five sets therefore overlap at the two ends; the
+sankey figure compares their functional composition rather than tracking
+individual KOs.
+
+```{r ko-annotation}
+ko_level <- fread(KO_LEVEL_FILE, sep = "\t",
+                  na.strings = "", quote = "",
+                  select = c("level2", "KO", "KO_name"))
+ko_level[, level2 := trimws(level2)]
+ko_level[, KO_name := trimws(KO_name)]
+ko_map <- ko_level[!duplicated(KO)]
+pgpg <- fread(PGPG_FILE, sep = "\t",
+              select = c("KO", "Lv1", "Lv2", "Lv3"))
+ko_pgpg <- pgpg[!duplicated(KO)]
+
+ko_annot <- merge(ko_map, ko_pgpg, by = "KO", all = TRUE)
+ko_annot[is.na(level2) | level2 == "", level2 := "Unclassified"]
+ko_annot[is.na(Lv3) | Lv3 == "", Lv3 := "Unknown"]
+write_int(ko_annot, CHAPTER, "ko_annotation")
+
+# KO sets for the sankey figure. The Seed/Germ concordant sets require the
+# merged analysis to agree as well, so both ends of the figure are nested in
+# the Merged+/Merged- sets (three-way concordance).
+state_of <- function(flag, fdr, eff) {
+  fifelse(flag != "ok", "Not estimable",
+    fifelse(!is.na(fdr) & fdr < 0.05,
+            fifelse(eff > 0, "Positive", "Negative"), "Not significant"))
+}
+ko_class <- ko_merged[, .(KO, merged = state_of(flag, FDR, log2OR))]
+ko_class <- merge(
+  ko_class,
+  ko_pool[pool == "16S Seed",
+          .(KO, seed = state_of(flag, FDR, log2OR))],
+  by = "KO", all.x = TRUE)
+ko_class <- merge(
+  ko_class,
+  ko_pool[pool == "16S Germ",
+          .(KO, germ = state_of(flag, FDR, log2OR))],
+  by = "KO", all.x = TRUE)
+ko_class[is.na(seed), seed := "Not estimable"]
+ko_class[is.na(germ), germ := "Not estimable"]
+ko_sets <- list(
+  `Seed+ & Germ+` = ko_class[merged == "Positive" & seed == "Positive" &
+                               germ == "Positive", KO],
+  `Merged+`       = ko_class[merged == "Positive", KO],
+  `Merged NS`     = ko_class[merged == "Not significant", KO],
+  `Merged-`       = ko_class[merged == "Negative", KO],
+  `Seed- & Germ-` = ko_class[merged == "Negative" & seed == "Negative" &
+                               germ == "Negative", KO])
+ko_class[, `:=`(in_SeedGerm_pos = KO %in% ko_sets[[1]],
+                in_Merged_pos   = KO %in% ko_sets[[2]],
+                in_Merged_NS    = KO %in% ko_sets[[3]],
+                in_Merged_neg   = KO %in% ko_sets[[4]],
+                in_SeedGerm_neg = KO %in% ko_sets[[5]])]
+write_int(ko_class, CHAPTER, "ko_seed_germ_class")
+cat(sprintf("KO sets: %s\n",
+            paste(sprintf("%s=%d", names(ko_sets), lengths(ko_sets)),
+                  collapse = ", ")))
+```
+
+# 6. Cross-pool consistency / 跨池一致性
+
+For every trait (and KO) the number of estimable pools, the number of pools with
+a significant positive and negative association, and the median effect are
+summarised. A trait is **consistent** when at least 70%
+of its estimable pools are significant in the same direction; at least three
+estimable pools are required before a trait can be called consistent (a single
+pool cannot establish consistency). Traits significant in only some pools are
+**context-specific**. The three-pool minimum is a guard, not a significance
+threshold, and is stated in the table.
+
+```{r consistency}
+cons_bool <- pool_bool[flag == "ok", .(
+  n_estimable = .N,
+  n_sig_pos = sum(FDR < 0.05 & log2OR > 0),
+  n_sig_neg = sum(FDR < 0.05 & log2OR < 0),
+  median_log2OR = median(log2OR)
+), by = .(trait, source)]
+cons_num <- pool_num[flag == "ok", .(
+  n_estimable = .N,
+  n_sig_pos = sum(FDR < 0.05 & rho > 0),
+  n_sig_neg = sum(FDR < 0.05 & rho < 0),
+  median_rho = median(rho)
+), by = .(trait, source)]
+cons_ko <- ko_pool[flag == "ok", .(
+  n_estimable = .N,
+  n_sig_pos = sum(FDR < 0.05 & log2OR > 0),
+  n_sig_neg = sum(FDR < 0.05 & log2OR < 0),
+  median_log2OR = median(log2OR)
+), by = .(trait = KO)]
+cons_ko[, source := "PICRUSt2"]
+
+classify_consistency <- function(d, type, estimate_col) {
+  d <- copy(d)
+  d[, `:=`(frac_pos = n_sig_pos / n_estimable,
+           frac_neg = n_sig_neg / n_estimable)]
+  d[, consistency := fcase(
+    n_estimable < 3L, "Insufficient pools",
+    frac_pos >= 0.7, "Consistent positive",
+    frac_neg >= 0.7, "Consistent negative",
+    n_sig_pos + n_sig_neg > 0L, "Context-specific",
+    default = "Not significant")]
+  d[, `:=`(type = type,
+           estimate = get(estimate_col))]
+  for (cc in intersect(c("median_log2OR", "median_rho", "estimate_col"),
+                       names(d))) d[, (cc) := NULL]
+  setcolorder(d, c("type", "source", "trait", "n_estimable", "n_sig_pos",
+                   "n_sig_neg", "frac_pos", "frac_neg", "estimate",
+                   "consistency"))
+  d[]
+}
+cons <- rbindlist(list(
+  classify_consistency(cons_bool, "boolean", "median_log2OR"),
+  classify_consistency(cons_num,  "numeric", "median_rho"),
+  classify_consistency(cons_ko,   "ko",      "median_log2OR")
+), fill = TRUE)
+cat("Consistency classes:\n")
+print(cons[, .N, by = .(type, consistency)][order(type, consistency)])
+```
+
+# 7. Result tables / 结果表
+
+```{r tables}
+bool_cols <- c("source", "trait", "n", "n_true", "prevalence", "log2OR", "se",
+               "OR", "OR_lo", "OR_hi", "p", "FDR", "state", "flag")
+merged_long <- rbindlist(list(
+  cbind(kingdom = "16S", type = "boolean",
+        bool16_merged[, ..bool_cols], rho = NA_real_),
+  cbind(kingdom = "16S", type = "numeric",
+        num16_merged[, .(source, trait, n, p, FDR, state, flag)],
+        n_true = NA_integer_, prevalence = NA_real_,
+        log2OR = NA_real_, se = NA_real_, OR = NA_real_,
+        OR_lo = NA_real_, OR_hi = NA_real_, rho = num16_merged$rho),
+  cbind(kingdom = "16S", type = "ko",
+        ko_merged[, .(source = "PICRUSt2", trait = KO, n,
+                      n_true = n_present, prevalence, log2OR, se,
+                      OR, OR_lo, OR_hi, p, FDR, state, flag)],
+        rho = NA_real_)
+), fill = TRUE)
+merged_long <- merge(merged_long,
+                     ko_annot[, .(trait = KO, KO_name, level2, Lv1, Lv2, Lv3)],
+                     by = "trait", all.x = TRUE)
+setcolorder(merged_long, c("kingdom", "type", "source", "trait", "n", "n_true",
+                           "prevalence", "log2OR", "se", "OR", "OR_lo", "OR_hi",
+                           "rho", "p", "FDR", "state", "flag",
+                           "KO_name", "level2", "Lv1", "Lv2", "Lv3"))
+write_tab(merged_long, CHAPTER, "Tab_5_traits_merged")
+
+bypool_long <- rbindlist(list(
+  cbind(kingdom = "16S", type = "boolean",
+        pool_bool[, .(pool, grain, source, trait, n, n_true, prevalence,
+                      log2OR, se, OR, OR_lo, OR_hi, p, FDR, state, flag)],
+        rho = NA_real_),
+  cbind(kingdom = "16S", type = "numeric",
+        pool_num[, .(pool, grain, source, trait, n, n_true = NA_integer_,
+                     prevalence = NA_real_, log2OR = NA_real_, se = NA_real_,
+                     OR = NA_real_, OR_lo = NA_real_, OR_hi = NA_real_,
+                     p, FDR, state, flag)],
+        rho = pool_num$rho)
+), fill = TRUE)
+write_tab(bypool_long, CHAPTER, "Tab_5_traits_bypool")
+
+ko_bypool <- merge(ko_pool, ko_annot, by = "KO", all.x = TRUE)
+write_tab(ko_bypool, CHAPTER, "Tab_5_ko_bypool")
+write_tab(cons, CHAPTER, "Tab_5_trait_consistency")
+
+# intermediates
+write_int(tr[["16S"]][, c("taxid", BOOL16, NUM16), with = FALSE],
+          CHAPTER, "trait_matrix_16s")
+write_int(bypool_long, CHAPTER, "trait_pool_tests")
+write_int(ko_bypool, CHAPTER, "ko_pool_tests")
+save_rds(list(merged = merged_tr, pools = trait_pools), CHAPTER, "trait_models")
+save_rds(list(merged = ko_merged, pools = ko_pools), CHAPTER, "ko_models")
+save_rds(list(boolean = tr[["16S"]][, c("taxid", BOOL16), with = FALSE],
+              numeric = tr[["16S"]][, c("taxid", NUM16), with = FALSE]),
+         CHAPTER, "trait_matrices")
+cat("Tables written.\n")
+```
+
+# 8. Figures / 图件
+
+All figures use the 8 pt Arial house style. Effects are HBS-only (no NRH
+contrast). Heatmaps and forests use the chapter palette (orange = positive,
+blue = negative); the volcanoes use annotation-family palettes. In the two
+volcanoes, point shape encodes cross-pool concordance: triangles mark traits
+significant in both the Seed and Germ pools in the same direction, squares mark
+opposite directions, and circles mark all other traits.
+
+## 8.1 Boolean trait volcano (merged 16S) / 布尔性状火山图
+
+```{r fig-boolean-volcano}
+# point shape: Seed and Germ pools both significant in the same direction
+# (triangle) or in opposite directions (square); all other traits are circles
+seed_germ_shape <- function(d, eff) {
+  sig_rows <- function(pp) d[pool == pp & flag == "ok" & !is.na(FDR) &
+                               FDR < 0.05, .(trait, sgn = sign(get(eff)))]
+  sm <- merge(sig_rows("16S Seed"), sig_rows("16S Germ"), by = "trait",
+              suffixes = c("_seed", "_germ"))
+  out <- data.table(trait = unique(d$trait), shape = "Other")
+  out[trait %in% sm[sgn_seed == sgn_germ, trait], shape := "Same direction"]
+  out[trait %in% sm[sgn_seed != sgn_germ, trait], shape := "Opposite direction"]
+  out[, shape := factor(shape, levels = c("Same direction",
+                                          "Opposite direction", "Other"))]
+  out
+}
+SHAPE_VALS <- c(`Same direction` = 17, `Opposite direction` = 15, Other = 16)
+# legend labels carry the number of traits in each shape class
+shape_labs <- function(d) {
+  tb <- table(factor(d$shape, levels = names(SHAPE_VALS)))
+  setNames(sprintf("%s (n=%d)", names(tb), as.integer(tb)), names(tb))
+}
+
+bool_volcano <- function(r) {
+  d <- copy(r[flag == "ok"])
+  d <- merge(d, seed_germ_shape(pool_bool, "log2OR"), by = "trait",
+             all.x = TRUE, sort = FALSE)
+  d[, `:=`(neglog10FDR = -log10(pmax(FDR, 1e-300)),
+           sig = FDR < 0.05)]
+  # label the ten most significant positive and five most significant negative
+  # traits
+  lab_pos <- d[sig == TRUE & log2OR > 0][order(FDR)][1:min(10, .N)]
+  lab_neg <- d[sig == TRUE & log2OR < 0][order(FDR)][1:min(5, .N)]
+  labs <- rbind(lab_pos, lab_neg)
+  labs[, label := short_label(trait)]
+  cat(sprintf("boolean volcano: %d points (%d same, %d opposite, %d other); %d labelled\n",
+              nrow(d), sum(d$shape == "Same direction"),
+              sum(d$shape == "Opposite direction"),
+              sum(d$shape == "Other"), nrow(labs)))
+  ggplot(d, aes(log2OR, neglog10FDR, shape = shape)) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed",
+               colour = "grey50", linewidth = 0.3) +
+    geom_vline(xintercept = 0, colour = "grey70", linewidth = 0.3) +
+    geom_point(aes(colour = source), size = 1.5, alpha = 0.85) +
+    geom_text_repel(data = labs,
+                    aes(x = log2OR, y = neglog10FDR, label = label),
+                    inherit.aes = FALSE, size = 2.0, colour = "black",
+                    max.overlaps = Inf, segment.size = 0.18,
+                    min.segment.length = 0, seed = 20261121,
+                    show.legend = FALSE) +
+    scale_colour_manual(values = c(FAPROTAX2 = "#F4A261",
+                                   BugBase = "#547FB6",
+                                   MetaTraits = "#7DCEA0"),
+                        name = "Trait source") +
+    scale_shape_manual(values = SHAPE_VALS, name = "Seed/Germ",
+                       labels = shape_labs(d)) +
+    labs(x = "log2 OR per doubling of host breadth",
+         y = expression(-log[10]("BH-FDR"))) +
+    theme_seed(8) +
+    theme(legend.position = "bottom",
+          legend.box = "vertical",
+          legend.key.size = unit(0.25, "cm"),
+          legend.spacing.x = unit(0.1, "cm")) +
+    guides(colour = guide_legend(nrow = 1, order = 1),
+           shape = guide_legend(nrow = 2, order = 2))
+}
+save_fig(bool_volcano(bool16_merged), CHAPTER, "Fig_5_boolean_volcano", 90, 104)
+embed_fig(CHAPTER, "Fig_5_boolean_volcano")
+```
+
+## 8.2 Numeric trait volcano (merged 16S) / 数值性状火山图
+
+```{r fig-numeric-volcano}
+num_family <- function(t) {
+  ifelse(grepl("temperature|pH|salinity", t), "Physiology",
+    ifelse(grepl("GC|coding.density", t), "Genome composition",
+           "Genome size/count"))
+}
+num_volcano <- function(r) {
+  # all estimable traits are plotted; only FDR < 0.05 traits are labelled
+  d <- copy(r[flag == "ok"])
+  d <- merge(d, seed_germ_shape(pool_num, "rho"), by = "trait",
+             all.x = TRUE, sort = FALSE)
+  d[, `:=`(neglog10FDR = -log10(pmax(FDR, 1e-300)),
+           sig = FDR < 0.05,
+           family = num_family(trait),
+           label = short_label(trait))]
+  labs <- d[sig == TRUE]
+  cat(sprintf("numeric volcano: %d points, %d labelled\n", nrow(d), nrow(labs)))
+  ggplot(d, aes(rho, neglog10FDR, colour = family, shape = shape)) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed",
+               colour = "grey50", linewidth = 0.3) +
+    geom_vline(xintercept = 0, colour = "grey70", linewidth = 0.3) +
+    geom_point(size = 2.2, alpha = 0.9) +
+    geom_text_repel(data = labs,
+                    aes(x = rho, y = neglog10FDR, label = label),
+                    inherit.aes = FALSE, size = 2.6, colour = "black",
+                    max.overlaps = Inf, segment.size = 0.18,
+                    min.segment.length = 0, force = 1.5, box.padding = 0.45,
+                    seed = 20261121, show.legend = FALSE) +
+    scale_colour_manual(values = c(Physiology = "#F2CC8F",
+                                   `Genome composition` = "#A8DADC",
+                                   `Genome size/count` = "#A7C957"),
+                        name = "Trait family") +
+    scale_shape_manual(values = SHAPE_VALS, name = "Seed/Germ",
+                       labels = shape_labs(d)) +
+    labs(x = "Spearman rho with host breadth",
+         y = expression(-log[10]("BH-FDR"))) +
+    theme_seed(8) +
+    theme(legend.position = "bottom",
+          legend.box = "vertical",
+          legend.key.size = unit(0.25, "cm")) +
+    guides(colour = guide_legend(nrow = 2, order = 1),
+           shape = guide_legend(nrow = 2, order = 2))
+}
+save_fig(num_volcano(num16_merged), CHAPTER, "Fig_5_numeric_volcano", 90, 108)
+embed_fig(CHAPTER, "Fig_5_numeric_volcano")
+```
+
+## 8.3 Boolean trait heatmaps across pools / 布尔性状热图
+
+The boolean heatmap is split into two figures. The first shows every trait that
+is significant with the same direction in the merged analysis and in both the
+Seed and Germ pools (positive above, negative below); the four traits that are
+also NSD-positive are shown first, the other positive traits are ordered by the
+NSD log2 OR and negative traits by the merged log2 OR. The second shows every
+trait that is significant
+in both the Seed and Germ pools but in opposite directions (Germ-positive above,
+Germ-negative below). Columns are the merged analysis and the seven qualified
+pools; fill is the signed log2 OR clipped at ±2; stars mark FDR tiers within
+the column (`*` < 0.05, `**` < 0.01, `***` < 0.001); grey tiles are traits that
+were not estimable in that column.
+
+```{r fig-boolean-heatmap}
+# three-tier significance markers used by the heatmaps and the forest
+fdr_star <- function(fdr, flag = "ok") {
+  fifelse(flag != "ok" | is.na(fdr), "",
+    fifelse(fdr < 0.001, "***",
+      fifelse(fdr < 0.01, "**", fifelse(fdr < 0.05, "*", ""))))
+}
+
+boolean_heatmap <- function(d, dm, rows) {
+  pools <- c("16S merged", POOLS16)
+  dm <- dm[, .(pool = "16S merged", trait, source, log2OR, FDR, flag)]
+  dd <- rbind(d[, .(pool, trait, source, log2OR, FDR, flag)], dm, fill = TRUE)
+  dd <- merge(CJ(trait = rows, pool = pools), dd,
+              by = c("trait", "pool"), all.x = TRUE)
+  dd[, `:=`(fill_val = fifelse(flag == "ok", log2OR, NA_real_),
+            star_lab = fdr_star(FDR, flag))]
+  grain_map <- setNames(as.character(pools16$grain), pools16$pool)
+  grain_map["16S merged"] <- "Merged"
+  dd[, `:=`(pool = factor(pool, levels = pools),
+            grain = factor(grain_map[as.character(pool)],
+                           levels = c("Merged", "Coarse A", "Coarse B",
+                                      "Medium")),
+            trait = factor(trait, levels = rev(rows)))]
+  x_labs <- setNames(sub("^16S ", "", pools), pools)
+  x_labs["16S merged"] <- "Merged"
+  src_map <- c(FAPROTAX2 = "FP", BugBase = "BB", MetaTraits = "MT")
+  src_by_trait <- setNames(d$source[match(rows, d$trait)], rows)
+  y_labs <- setNames(
+    paste0(src_map[src_by_trait[rev(rows)]], " ", short_label(rev(rows))),
+    rev(rows))
+  ggplot(dd, aes(pool, trait)) +
+    geom_tile(aes(fill = fill_val), colour = "white", linewidth = 0.25) +
+    geom_text(aes(label = star_lab), size = 2.2, family = "Arial",
+              colour = "black") +
+    scale_fill_gradient2(low = COL_NEG, mid = "white", high = COL_POS,
+                         midpoint = 0, limits = c(-2, 2), oob = scales::squish,
+                         na.value = "grey90", breaks = -2:2,
+                         name = "log2 OR per doubling of host breadth") +
+    facet_grid(~grain, scales = "free_x", space = "free_x") +
+    scale_x_discrete(labels = x_labs) +
+    scale_y_discrete(labels = y_labs) +
+    labs(x = NULL, y = NULL) +
+    theme_seed(8) +
+    theme(axis.text.x = element_text(angle = 0, hjust = 0.5, size = 6.5),
+          axis.text.y = element_text(size = 6.5),
+          strip.text = element_text(size = 7),
+          panel.grid = element_blank(),
+          axis.ticks = element_blank(),
+          legend.position = "bottom",
+          legend.title = element_text(size = 7))
+}
+
+# trait states in the merged analysis and in the Seed/Germ pools
+b_long <- rbind(
+  pool_bool[, .(pool, trait, source, log2OR, FDR, flag)],
+  bool16_merged[, .(pool = "16S merged", trait, source, log2OR, FDR, flag)])
+b_long[, state := fifelse(flag != "ok" | is.na(FDR), NA_character_,
+  fifelse(FDR < 0.05, fifelse(log2OR > 0, "Positive", "Negative"),
+          "Not significant"))]
+b_state <- merge(
+  merge(b_long[pool == "16S Seed",
+               .(trait, seed = state, seed_or = log2OR)],
+        b_long[pool == "16S Germ",
+               .(trait, germ = state, germ_or = log2OR)], by = "trait"),
+  b_long[pool == "16S NSD",
+         .(trait, nsd = state, nsd_or = log2OR)], by = "trait")
+b_state <- merge(
+  b_state,
+  b_long[pool == "16S merged",
+         .(trait, merged = state, merged_or = log2OR)], by = "trait")
+
+# figure 1: merged, Seed and Germ all significant in the same direction.
+# Four designated traits (all also NSD-positive) sit at the top in this order;
+# the remaining concordant-positive traits are ordered by the NSD log2 OR from
+# positive to negative. Negative traits are ordered by the merged log2 OR.
+top_pos_fixed <- c(
+  "bugbase_Contains_Mobile_Elements",
+  "bugbase_Potentially_Pathogenic",
+  "metatraits_growth..glycerol",
+  "faprotax_arsenite_oxidation_energy_yielding")
+pos_block <- b_state[merged == "Positive" & seed == "Positive" &
+                       germ == "Positive"]
+stopifnot(all(top_pos_fixed %in% pos_block$trait))
+rows_c_pos <- c(top_pos_fixed,
+                pos_block[!trait %in% top_pos_fixed][order(-nsd_or), trait])
+rows_c_neg <- b_state[merged == "Negative" & seed == "Negative" &
+                        germ == "Negative"][order(merged_or), trait]
+rows_conc <- c(rows_c_pos, rows_c_neg)
+height_conc <- max(120, 40 + 3.2 * length(rows_conc))
+p_bool_conc <- boolean_heatmap(pool_bool, bool16_merged, rows_conc)
+
+# figure 2: Seed and Germ significant in opposite directions
+rows_d_pos <- b_state[germ == "Positive" & seed == "Negative"
+                      ][order(-germ_or), trait]
+rows_d_neg <- b_state[germ == "Negative" & seed == "Positive"
+                      ][order(germ_or), trait]
+rows_disc <- c(rows_d_pos, rows_d_neg)
+p_bool_disc <- boolean_heatmap(pool_bool, bool16_merged, rows_disc)
+cat(sprintf(paste0("boolean heatmaps: concordant %d (+%d / -%d); ",
+                   "discordant %d (Germ+ %d / Germ- %d); height %.0f mm\n"),
+            length(rows_conc), length(rows_c_pos), length(rows_c_neg),
+            length(rows_disc), length(rows_d_pos), length(rows_d_neg),
+            height_conc))
+```
+
+## 8.4 Numeric trait heatmap across pools / 数值性状热图
+
+The numeric rows use the same merged + seven-pool columns and are split for the
+combined figures: concordant rows (merged + Seed + Germ all positive or all
+negative) and the Seed/Germ opposite rows. The remaining numeric traits are
+covered by the numeric volcano and forest rather than a separate heatmap. Fill
+is the Spearman rho clipped at ±0.25; stars mark FDR tiers (`*` < 0.05,
+`**` < 0.01, `***` < 0.001); grey tiles are not estimable.
+
+```{r fig-numeric-heatmap}
+numeric_heatmap <- function(d, dm, rows) {
+  d <- copy(d)
+  pools <- c("16S merged", POOLS16)
+  dm <- dm[, .(pool = "16S merged", trait, rho, FDR, flag)]
+  dd <- rbind(d[, .(pool, trait, rho, FDR, flag)], dm, fill = TRUE)
+  dd <- merge(CJ(trait = rows, pool = pools), dd,
+              by = c("trait", "pool"), all.x = TRUE)
+  dd[, `:=`(fill_val = fifelse(flag == "ok", rho, NA_real_),
+            star_lab = fdr_star(FDR, flag))]
+  grain_map <- setNames(as.character(pools16$grain), pools16$pool)
+  grain_map["16S merged"] <- "Merged"
+  dd[, `:=`(pool = factor(pool, levels = pools),
+            grain = factor(grain_map[as.character(pool)],
+                           levels = c("Merged", "Coarse A", "Coarse B",
+                                      "Medium")),
+            trait = factor(trait, levels = rev(rows)))]
+  x_labs <- setNames(sub("^16S ", "", pools), pools)
+  x_labs["16S merged"] <- "Merged"
+  y_labs <- setNames(short_label(rev(rows)), rev(rows))
+  ggplot(dd, aes(pool, trait)) +
+    geom_tile(aes(fill = fill_val), colour = "white", linewidth = 0.25) +
+    geom_text(aes(label = star_lab), size = 2.2, family = "Arial") +
+    scale_fill_gradient2(low = COL_NEG, mid = "white", high = COL_POS,
+                         midpoint = 0, limits = c(-0.25, 0.25),
+                         oob = scales::squish, na.value = "grey90",
+                         name = "Spearman rho") +
+    facet_grid(~grain, scales = "free_x", space = "free_x") +
+    scale_x_discrete(labels = x_labs) +
+    scale_y_discrete(labels = y_labs) +
+    labs(x = NULL, y = NULL) +
+    theme_seed(8) +
+    theme(axis.text.x = element_text(angle = 0, hjust = 0.5, size = 6.5),
+          axis.text.y = element_text(size = 6.5),
+          strip.text = element_text(size = 7),
+          panel.grid = element_blank(),
+          axis.ticks = element_blank(),
+          legend.position = "bottom",
+          legend.title = element_text(size = 7))
+}
+# Rows are grouped by direction: merged + Seed + Germ all positive, all
+# negative, Seed-positive/Germ-negative, Seed-negative/Germ-positive, and the
+# remaining traits (any other pattern) at the bottom.
+n_long <- rbind(
+  pool_num[, .(pool, trait, rho, FDR, flag)],
+  num16_merged[, .(pool = "16S merged", trait, rho, FDR, flag)])
+n_long[, state := fifelse(flag != "ok" | is.na(FDR), NA_character_,
+  fifelse(FDR < 0.05, fifelse(rho > 0, "Positive", "Negative"),
+          "Not significant"))]
+n_state <- merge(
+  merge(n_long[pool == "16S Seed", .(trait, seed = state)],
+        n_long[pool == "16S Germ", .(trait, germ = state)], by = "trait"),
+  n_long[pool == "16S merged",
+         .(trait, merged = state, merged_rho = rho)], by = "trait")
+n_state[, block := fcase(
+  merged == "Positive" & seed == "Positive" & germ == "Positive", 1L,
+  merged == "Negative" & seed == "Negative" & germ == "Negative", 2L,
+  seed == "Positive" & germ == "Negative", 3L,
+  seed == "Negative" & germ == "Positive", 4L,
+  default = 5L)]
+n_state[, ord := fcase(
+  block %in% c(1L, 3L, 5L), -merged_rho,
+  block %in% c(2L, 4L), merged_rho)]
+setorder(n_state, block, ord)
+cat(sprintf("numeric heatmap blocks: M+S+G+=%d, M-S-G-=%d, S+G-=%d, S-G+=%d, other=%d\n",
+            sum(n_state$block == 1L), sum(n_state$block == 2L),
+            sum(n_state$block == 3L), sum(n_state$block == 4L),
+            sum(n_state$block == 5L)))
+# numeric rows that match the two boolean blocks; the remaining numeric traits
+# are covered by the numeric volcano and forest
+rows_num_conc <- n_state[block %in% c(1L, 2L), trait]
+rows_num_disc <- n_state[block %in% c(3L, 4L), trait]
+p_num_conc <- numeric_heatmap(pool_num, num16_merged, rows_num_conc)
+p_num_disc <- numeric_heatmap(pool_num, num16_merged, rows_num_disc)
+```
+
+## 8.5 Combined boolean and numeric heatmaps / 布尔与数值组合热图
+
+The boolean rows selected above are stacked with the numeric rows that carry
+the same direction pattern: the concordant numeric traits (merged + Seed + Germ
+all positive or all negative) go under the concordant boolean block, and the
+Seed/Germ opposite numeric trait goes under the discordant block. The boolean
+block is on top and the numeric block below; the two blocks keep their own fill
+scales (log2 OR and Spearman rho) and legends.
+
+```{r fig-combined-heatmaps}
+p_bool_conc_top <- p_bool_conc + theme(axis.text.x = element_blank())
+p_bool_disc_top <- p_bool_disc + theme(axis.text.x = element_blank())
+h_num_conc <- 60
+h_num_disc <- 50
+comb_conc <- (p_bool_conc_top / p_num_conc) +
+  plot_layout(heights = c(height_conc, h_num_conc))
+comb_disc <- (p_bool_disc_top / p_num_disc) +
+  plot_layout(heights = c(88, h_num_disc))
+save_fig(comb_conc, CHAPTER, "Fig_5_trait_heatmap_concordant", 153,
+         height_conc + h_num_conc)
+embed_fig(CHAPTER, "Fig_5_trait_heatmap_concordant")
+save_fig(comb_disc, CHAPTER, "Fig_5_trait_heatmap_discordant", 153,
+         88 + h_num_disc)
+embed_fig(CHAPTER, "Fig_5_trait_heatmap_discordant")
+cat(sprintf(paste0("combined heatmaps: concordant %d boolean + %d numeric; ",
+                   "discordant %d boolean + %d numeric\n"),
+            length(rows_conc), length(rows_num_conc),
+            length(rows_disc), length(rows_num_disc)))
+```
+
+## 8.6 Boolean trait forest (merged 16S) / 布尔性状森林图
+
+Only traits with FDR < 0.05 in the merged analysis are shown, in two columns:
+FAPROTAX2 and BugBase on the left, MetaTraits on the right. Trait labels carry
+FDR stars (`*` < 0.05, `**` < 0.01, `***` < 0.001). The x axis is the log2 OR
+per doubling of host breadth with 95% Wald intervals.
+
+```{r fig-boolean-forest}
+bool_forest <- function(r, srcs) {
+  d <- copy(r[flag == "ok" & FDR < 0.05 & source %in% srcs])
+  if (!nrow(d)) return(NULL)
+  d[, `:=`(direction = factor(fifelse(log2OR > 0, "Positive", "Negative"),
+                              levels = c("Negative", "Positive")),
+           source = factor(source, levels = srcs),
+           log2OR_lo = log2OR - 1.96 * se,
+           log2OR_hi = log2OR + 1.96 * se,
+           label = paste0(short_label(trait), " ", fdr_star(FDR, flag)))]
+  setorder(d, source, log2OR)
+  d[, trait_f := factor(trait, levels = d$trait)]
+  y_labs <- setNames(d$label, d$trait)
+  ggplot(d, aes(log2OR, trait_f, colour = direction)) +
+    geom_vline(xintercept = 0, linetype = 2, colour = "grey45",
+               linewidth = 0.3) +
+    geom_pointrange(aes(xmin = log2OR_lo, xmax = log2OR_hi),
+                    size = 0.16, linewidth = 0.3) +
+    scale_y_discrete(labels = y_labs) +
+    scale_colour_manual(values = c(Negative = COL_NEG, Positive = COL_POS),
+                        name = NULL) +
+    labs(x = "log2 OR per doubling of host breadth", y = NULL) +
+    facet_wrap(~ source, ncol = 1, scales = "free_y", space = "free_y",
+               strip.position = "top") +
+    theme_seed(8) +
+    theme(axis.text.y = element_text(size = 5.0),
+          axis.title.x = element_text(size = 7),
+          strip.text = element_text(size = 7),
+          panel.spacing = unit(0.15, "lines"),
+          legend.position = "bottom")
+}
+# two-column layout: FAPROTAX2 + BugBase on the left, MetaTraits on the right
+f_bool_l <- bool_forest(bool16_merged, c("FAPROTAX2", "BugBase"))
+f_bool_r <- bool_forest(bool16_merged, "MetaTraits")
+p_forest <- (f_bool_l + f_bool_r +
+               plot_layout(widths = c(1, 1.1), guides = "collect")) &
+  theme(legend.position = "top")
+n_left  <- nrow(f_bool_l$data)
+n_right <- nrow(f_bool_r$data)
+height_forest <- max(110, 30 + 2.0 * max(n_left, n_right))
+save_fig(p_forest, CHAPTER, "Fig_5_boolean_forest", 160, height_forest)
+embed_fig(CHAPTER, "Fig_5_boolean_forest")
+cat(sprintf("boolean forest: %d significant traits (left %d, right %d); height %.0f mm\n",
+            n_left + n_right, n_left, n_right, height_forest))
+```
+
+## 8.7 Numeric trait forest (merged 16S) / 数值性状森林图
+
+The twelve numeric traits with FDR < 0.05 in the merged analysis are shown with
+95% confidence intervals on the Spearman rho (Fisher z transformation). Trait
+labels carry FDR stars and rows are ordered by rho. Points use the same orange
+(positive) and blue (negative) colours as the boolean forest.
+
+```{r fig-numeric-forest}
+num_forest <- function(r) {
+  d <- copy(r[flag == "ok" & FDR < 0.05])
+  if (!nrow(d)) return(NULL)
+  d[, `:=`(direction = factor(fifelse(rho > 0, "Positive", "Negative"),
+                              levels = c("Negative", "Positive")),
+           rho_lo = tanh(atanh(rho) - 1.96 / sqrt(n - 3)),
+           rho_hi = tanh(atanh(rho) + 1.96 / sqrt(n - 3)),
+           label = paste0(short_label(trait), " ", fdr_star(FDR, flag)))]
+  setorder(d, rho)
+  d[, trait_f := factor(trait, levels = d$trait)]
+  y_labs <- setNames(d$label, d$trait)
+  ggplot(d, aes(rho, trait_f, colour = direction)) +
+    geom_vline(xintercept = 0, linetype = 2, colour = "grey45",
+               linewidth = 0.3) +
+    geom_pointrange(aes(xmin = rho_lo, xmax = rho_hi),
+                    size = 0.2, linewidth = 0.35) +
+    scale_y_discrete(labels = y_labs) +
+    scale_colour_manual(values = c(Negative = COL_NEG, Positive = COL_POS),
+                        name = NULL) +
+    labs(title = "MetaTraits numeric",
+         x = "Spearman rho with host breadth", y = NULL) +
+    theme_seed(8) +
+    theme(axis.text.y = element_text(size = 6.5),
+          axis.title.x = element_text(size = 7),
+          plot.title = element_text(size = 8, hjust = 0),
+          legend.position = "bottom",
+          legend.key.size = unit(0.25, "cm"))
+}
+p_numforest <- num_forest(num16_merged)
+save_fig(p_numforest, CHAPTER, "Fig_5_numeric_forest", 100, 76.5)
+embed_fig(CHAPTER, "Fig_5_numeric_forest")
+cat(sprintf("numeric forest: %d significant traits\n", nrow(p_numforest$data)))
+```
+
+## 8.8 Functional composition of the KO sets (Sankey) / KO 集合功能组成
+
+Five KO sets are shown from left to right: Seed+ & Germ+, Merged+, Merged NS,
+Merged- and Seed- & Germ-. The two concordant sets are nested in the merged
+sets (every Seed+ & Germ+ KO is also Merged+), so the figure compares the
+functional composition of overlapping sets rather than tracking individual KOs
+across columns. Each column is normalised to 100% and the number of KOs is
+printed above it; ribbons connect the same annotation category in adjacent
+columns. The ten most frequent categories are shown individually and the
+remainder are pooled as `Other`; the PGPG map keeps `Unknown` as its own
+category. PGPG legend labels use readable English names from the old
+map, and the KEGG panel uses the shared PAL2 palette. The two
+maps are shown side by side with a single legend column at the far right (KEGG
+above PGPG); in both maps components covering at least 3% of a column carry
+their percentage inside the node.
+
+```{r fig-ko-set-sankey}
+CAT_COLS <- c(PAL_MULTI[1:10], "#D9D9D9")
+
+ribbon_df <- function(x1, x2, y1min, y1max, y2min, y2max, id, cat, n = 80L) {
+  tt <- seq(0, 1, length.out = n)
+  ss <- tt * tt * (3 - 2 * tt)
+  data.table(x = x1 + (x2 - x1) * tt,
+             ymin = y1min + (y2min - y1min) * ss,
+             ymax = y1max + (y2max - y1max) * ss,
+             id = id, Category = cat)
+}
+
+ko_set_sankey <- function(sets, cat_col, top_n = 10L, unknown = FALSE,
+                          label_map = NULL, pct_thr = NULL,
+                          pal = CAT_COLS, legend_title = NULL) {
+  GROUP_LEVELS <- names(sets)
+  d <- rbindlist(lapply(seq_along(sets), function(i)
+    data.table(KO = sets[[i]], Group = GROUP_LEVELS[i])))
+  d <- merge(d, ko_annot[, .(KO, Category = get(cat_col))],
+             by = "KO", all.x = TRUE)
+  if (unknown) {
+    d[is.na(Category) | Category == "", Category := "Unknown"]
+  } else {
+    d[is.na(Category) | Category == "", Category := "Unclassified"]
+  }
+  tt <- d[Category != "Unknown", .N, by = Category][order(-N, Category)]
+  top_cats <- head(tt$Category, top_n)
+  cat_levels <- c(top_cats, "Other", if (unknown) "Unknown")
+  d[, Cat2 := ifelse(Category %in% top_cats, Category,
+                     ifelse(unknown & Category == "Unknown", "Unknown",
+                            "Other"))]
+  full <- d[, .N, by = .(Group, Cat2)]
+  full <- merge(CJ(Group = GROUP_LEVELS, Cat2 = cat_levels), full,
+                by = c("Group", "Cat2"), all.x = TRUE)
+  full[is.na(N), N := 0L]
+  full[, `:=`(Group = factor(Group, levels = GROUP_LEVELS),
+              Cat2 = factor(Cat2, levels = cat_levels))]
+  full[, frac := N / sum(N), by = Group]
+  stack_levels <- if (unknown) {
+    c("Unknown", "Other", rev(top_cats))
+  } else {
+    c("Other", rev(top_cats))
+  }
+  nodes <- full[order(Group, match(as.character(Cat2), stack_levels))]
+  nodes[, x := as.numeric(Group)]
+  nodes[, ymax := cumsum(frac), by = Group]
+  nodes[, ymin := ymax - frac]
+
+  cols <- setNames(pal[seq_along(top_cats)], top_cats)
+  cols["Other"] <- "#D9D9D9"
+  if (unknown) cols["Unknown"] <- "#BDBDBD"
+
+  # legend labels: optional map to readable names (PGPG), then wrap; node
+  # percentages are drawn for components at or above pct_thr
+  legend_labels <- cat_levels
+  if (!is.null(label_map)) {
+    mapped <- unname(label_map[cat_levels])
+    legend_labels <- ifelse(is.na(mapped), cat_levels, mapped)
+  }
+  legend_labels <- vapply(legend_labels, function(s)
+    paste(strwrap(s, width = 40), collapse = "\n"), character(1))
+  pct_nodes <- if (is.null(pct_thr)) nodes[0] else nodes[frac >= pct_thr]
+  if (nrow(pct_nodes)) {
+    lum <- col2rgb(unname(cols[as.character(pct_nodes$Cat2)]))
+    pct_nodes[, txt_col := ifelse(
+      0.299 * lum[1, ] + 0.587 * lum[2, ] + 0.114 * lum[3, ] < 130,
+      "white", "grey10")]
+  }
+
+  W <- 0.408
+  ribbons <- rbindlist(lapply(seq_len(length(GROUP_LEVELS) - 1L), function(j) {
+    L <- nodes[Group == GROUP_LEVELS[j]]
+    R <- nodes[Group == GROUP_LEVELS[j + 1L]]
+    rbindlist(lapply(cat_levels, function(cc) {
+      yL <- L[Cat2 == cc]; yR <- R[Cat2 == cc]
+      if (!nrow(yL) || !nrow(yR) || yL$frac <= 0 || yR$frac <= 0) return(NULL)
+      ribbon_df(yL$x + W / 2, yR$x - W / 2, yL$ymin, yL$ymax,
+                yR$ymin, yR$ymax, id = paste(j, cc, sep = "_"), cat = cc)
+    }))
+  }))
+  col_tot <- full[, .(n_total = sum(N)), by = Group][order(Group)]
+  col_tot[, x := as.numeric(Group)]
+  x_labs <- c("Seed+ &\nGerm+", "Merged+", "Merged\nNS", "Merged-",
+              "Seed- &\nGerm-")
+  ggplot() +
+    geom_ribbon(data = ribbons,
+                aes(x = x, ymin = ymin, ymax = ymax, group = id,
+                    fill = Category),
+                alpha = 0.5, colour = NA) +
+    geom_rect(data = nodes,
+              aes(xmin = x - W / 2, xmax = x + W / 2,
+                  ymin = ymin, ymax = ymax, fill = Cat2),
+              colour = NA) +
+    geom_text(data = pct_nodes,
+              aes(x = x, y = (ymin + ymax) / 2,
+                  label = sprintf("%.0f%%", 100 * frac)),
+              inherit.aes = FALSE, size = 2.3, family = "Arial",
+              colour = if (nrow(pct_nodes)) pct_nodes$txt_col else NULL) +
+    geom_text(data = col_tot,
+              aes(x = x, y = 1.035,
+                  label = sprintf("n=%s", format(n_total, big.mark = ","))),
+              inherit.aes = FALSE, size = 2.4, vjust = 0) +
+    scale_fill_manual(values = cols, name = legend_title,
+                      labels = unname(legend_labels)) +
+    scale_x_continuous(breaks = seq_along(GROUP_LEVELS), labels = x_labs,
+                       limits = c(0.55, length(GROUP_LEVELS) + 0.45),
+                       expand = c(0, 0)) +
+    scale_y_continuous(limits = c(0, 1.10), expand = c(0, 0)) +
+    coord_cartesian(clip = "off") +
+    theme_void(base_size = 8) +
+    theme(text = element_text(family = "Arial"),
+          legend.position = "right",
+          legend.key.size = unit(0.3, "cm"),
+          legend.text = element_text(size = 6.7, lineheight = 0.9),
+          axis.text.x = element_text(size = 7, lineheight = 0.9,
+                                     margin = margin(t = 3)),
+          plot.margin = margin(8, 8, 8, 8))
+}
+
+# PGPG Lv3 legend names are embedded so the figure is self-contained.
+# 图中直接嵌入 PGPG Lv3 名称，避免外部依赖。
+PGPG_MAP <- c(
+  "COLONIZATION-PLANT_DERIVED_SUBSTRATE_USAGE" = "Plant-derived substrate utilization",
+  "CE-BACTERIAL_FITNESS"                       = "Bacterial fitness",
+  "NEUTRALIZING_ABIOTIC_STRESS"                = "Abiotic stress alleviation",
+  "NEUTRALIZING_BIOTIC_STRESS"                 = "Biotic stress alleviation",
+  "XENOBIOTICS_BIODEGRADATION"                 = "Xenobiotic degradation",
+  "PHOSPHATE_SOLUBILIZATION"                   = "Phosphate solubilization",
+  "NITROGEN_ACQUISITION"                       = "Nitrogen acquisition",
+  "CE-QUORUM_SENSING_RESPONSE|BIOFILM_FORMATION" = "Quorum sensing and biofilm formation",
+  "COLONIZATION-SURFACE_ATTACHMENT"            = "Surface attachment",
+  "CE-BACTERIAL_SECRETION"                     = "Bacterial secretion",
+  "PLANT_VITAMIN_PRODUCTION"                   = "Plant-beneficial vitamin production",
+  "COLONIZATION-MOTILITY|CHEMOTAXIS"           = "Motility and chemotaxis",
+  "HEAVY_METAL_DETOXIFICATION"                 = "Heavy metal detoxification",
+  "CE-CELL_ENVELOPE_REMODELLING"               = "Cell envelope remodeling",
+  "IRON_ACQUISITION"                           = "Iron acquisition")
+
+# KEGG panel uses the shared PAL2 palette / KEGG 面板使用统一 PAL2 配色
+PAL2 <- c("#855B67", "#B6BCCA", "#C1B5BF", "#FDE0E4",
+          "#78A495", "#8A926B", "#5D6C57", "#6E736D", "#E4E2C9",
+          "#CFE1D3", "#995B70", "#846992", "#D4C0C2", "#F7E09B",
+          "#099396", "#E7D6C2", "#547FB6", "#C5D8E7", "#BF6173",
+          "#3A5A40", "#90DBF4", "#641E16", "#BFEFEE", "#D35400",
+          "#1D3557", "#F1C40F", "#5B2C6F", "#A7C957", "#E63946",
+          "#355070", "#F4A261", "#1E5959", "#CB997E",
+          "#2A9D8F", "#FFE8D6", "#6D597A", "#F9C74F", "#2E4053",
+          "#A8DADC", "#BA4A00", "#7DCEA0", "#424949", "#E5989B",
+          "#E07A5F", "#F2CC8F", "#81B29A", "#3D405B", "#F4A261",
+          "#E76F51", "#2A9D8F", "#264653", "#F9C74F", "#A8DADC",
+          "#E63946", "#F1FAEE", "#457B9D", "#E0A458", "#6D597A",
+          "#B5E8D5", "#FFBF69", "#2EC4B6", "#1D3557", "#F6BD60",
+          "#8AC6C3", "#E56B6F", "#4A6FA5", "#F5E8C7", "#233D4D")
+KEGG_COLS <- c(PAL2[seq_len(10)], "#D9D9D9")
+
+kegg_set_sankey <- ko_set_sankey(ko_sets, "level2", top_n = 10L,
+                                 unknown = FALSE, pct_thr = 0.03,
+                                 pal = KEGG_COLS,
+                                 legend_title = "KEGG level 2")
+pgpg_set_sankey <- ko_set_sankey(ko_sets, "Lv3", top_n = 10L, unknown = TRUE,
+                                 label_map = PGPG_MAP, pct_thr = 0.03,
+                                 legend_title = "PGPG level 3")
+# side-by-side composite, 5:2; both legends collected at the far right,
+# KEGG above PGPG
+combined_sankey <- (kegg_set_sankey | pgpg_set_sankey) +
+  plot_layout(widths = c(1, 1), guides = "collect") &
+  theme(legend.position = "right",
+        legend.title = element_text(size = 8.1),
+        plot.margin = margin(4, 4, 4, 4))
+save_fig(combined_sankey, CHAPTER, "Fig_5_ko_class_sankey", 300, 120)
+embed_fig(CHAPTER, "Fig_5_ko_class_sankey")
+```
+
+# 9. Number check / 数值核对
+
+```{r log}
+sink_file <- file.path(log_dir(CHAPTER), "ch5_summary.log")
+lines <- c(
+  sprintf("16S boolean tested %d; sig %d (pos %d, neg %d)",
+          sum(bool16_merged$flag == "ok"),
+          sum(bool16_merged$FDR < 0.05, na.rm = TRUE),
+          sum(bool16_merged$FDR < 0.05 & bool16_merged$log2OR > 0, na.rm = TRUE),
+          sum(bool16_merged$FDR < 0.05 & bool16_merged$log2OR < 0, na.rm = TRUE)),
+  sprintf("16S numeric tested %d; sig %d",
+          sum(num16_merged$flag == "ok"),
+          sum(num16_merged$FDR < 0.05, na.rm = TRUE)),
+  sprintf("KO merged tested %d; sig %d (pos %d, neg %d)",
+          nrow(ko_merged), sum(ko_merged$FDR < 0.05),
+          sum(ko_merged$FDR < 0.05 & ko_merged$log2OR > 0),
+          sum(ko_merged$FDR < 0.05 & ko_merged$log2OR < 0)),
+  sprintf("KO sets: %s",
+          paste(sprintf("%s=%d", names(ko_sets), lengths(ko_sets)),
+                collapse = "; ")),
+  sprintf("consistency rows: %d", nrow(cons))
+)
+writeLines(lines, sink_file)
+cat(lines, sep = "\n")
+cat("\nCH5 DONE\n")
+```

@@ -1,57 +1,79 @@
-# 投稿代码编写规范 / Code style
+# Code and comment conventions / 代码与注释规范
 
-版本 v2.0，2026-11-12。适用于 `Downstream_analysis/github2`。本目录是从 `filtered_merge`、`filtered_region` 和现成功能预测结果出发的可复现下游流程；不重跑原始数据下载、质控和功能预测。
+Applies to the five chapter Rmd files, `00_preprocessing.Rmd` and `R/`.
+适用于五个章节 Rmd、`00_preprocessing.Rmd` 与 `R/`。
 
-## 组织 / Organization
+## Comments / 注释
 
-- `Analysis_pipeline.Rmd` 是唯一入口；`analysis/` 按 5 个主图章节 + 预处理/表格拆分。
-- 一次性分析直接写在章节 Rmd 中；只有跨章节复用、性能关键或服务器可选步骤保留为 `R/` 或 `scripts/server/` 文件。
-- 同一章节内逻辑紧密的代码块可以共享对象；跨章节通过 `results/checkpoints/` 和 `server_result/` 显式传递。
-- 不维护“最终版”“副本”或多个同义入口。
+- Use bilingual comments where an explanation is needed:
+  `# Explain the method or parameter / 说明方法或参数`.
+- Keep comments only for: scientific method, thresholds/parameters,
+  non-obvious handling, special cases, seeds, and input/output contracts.
+- Do not keep: change history (`2026-…`, “previously”, “replaced”),
+  prototype notes, debug prints, commented-out old code, decorative separators,
+  or machine-specific paths.
+- Do not change `#` inside strings, colours, regular expressions or code.
 
-## 数据 / Data
+- 必要处使用中英双语注释。
+- 只保留方法、阈值/参数、非直观处理、特殊情况、随机种子与输入输出约定。
+- 删除修改历史、原型说明、调试输出、注释掉的旧代码、装饰分隔线与本机路径。
+- 不改变字符串中的 `#`、颜色值、正则与代码行为。
 
-- `data/` 与 `server_result/` 只读；`results/` 是唯一可写区域。
-- `standard_merge`/`standard_region` 是生成结果，写入 `results/derived/css/`；metadata 放在 `data/metadata/`。
-- 输入不原位覆盖；派生结果按分析命名目录写入。
-- 每个输入和 server 结果都在 `MANIFEST.tsv` 中记录来源、大小和 SHA256。
+## Paths and inputs / 路径与输入
 
-## 注释 / Comments
+- All paths resolve from `PROJECT_ROOT` (`R/config.R`); no drive letters,
+  usernames or server paths in the pipeline.
+- Inputs are grouped in `data/`; server results in `server_result/`.
+- Never overwrite an input in place. Derived files go to `result/` (or
+  `result/prepared/` when a shipped prepared table is regenerated).
+- When a prepared file exists, read it and skip the computation; when it is
+  missing, either regenerate (if cheap and deterministic) or stop with a clear
+  message.
 
-- 必要注释中英文并列，每个逻辑步骤一条简短说明。
-- 不逐行解释赋值、读表、建目录或绘图函数。
-- 科学问题、统计口径和解释边界写在 Rmd 正文。
+- 所有路径从 `PROJECT_ROOT` 解析，不出现盘符、用户名或服务器路径。
+- 输入集中在 `data/`，服务器结果集中在 `server_result/`。
+- 不原位覆盖输入；派生结果写入 `result/`。
+- 预计算文件存在即读取并跳过计算；缺失时重算或明确报错。
 
-## 函数 / Functions
+## Analysis code / 分析代码
 
-- 先写顺序分析；不为一次读表、一次检验或一次保存文件新建函数。
-- 保留确有复用或性能需要的函数；`R/` 只放共享工具和性能代码。
-- 公共函数使用显式参数，不依赖调用环境中的隐式全局变量。
+- Do not change seeds, permutation/bootstrap counts, thresholds, FDR scopes,
+  model formulas or filtering rules when editing paths or comments.
+- Shared helpers live in `R/`; chapter-specific logic stays in the chapter.
+- Avoid duplicate helper definitions within a chapter; give distinct helpers
+  distinct names.
+- Server-equivalent steps are guarded by `SEED_ALLOW_SERVER_RECOMPUTE`; the
+  default is read-only.
 
-## 复现 / Reproducibility
+- 修改路径或注释时，不改变种子、置换/bootstrap 次数、阈值、FDR 范围、
+  模型公式与筛选规则。
+- 公共函数放 `R/`，章节特有逻辑留在章节内。
+- 避免同章重复定义同名辅助函数。
+- 服务器等价步骤由 `SEED_ALLOW_SERVER_RECOMPUTE` 控制，默认只读。
 
-- 全部使用项目相对路径；不出现个人盘符、服务器账户或 `setwd()`。
-- R 包版本记录在 `environment/required_packages.tsv` 和 `renv.lock`；分析不自动安装或更新包。
-- 随机分析明确设置已批准种子；置换/bootstrap 次数和样本范围不得在重构中改变。
-- 线程统一上限 16：`SEED_THREADS` 默认 16，R/BLAS/外部命令都遵守。
-- 默认读取 `server_result/`；缺失资产时停止并指向重算入口，不静默重算。
-- 明确区分“读取审核结果重新出图”和“重新拟合模型”。
+## Outputs / 输出
 
-## 图件 / Figures
+- Figures use `save_fig()` (PDF + JPG, millimetres); Chapter 3 keeps its
+  original stems and disables the `Fig_<n>_` check.
+- Each saved figure is embedded in place with `embed_fig()`; the rendered
+  document uses the JPG with a path relative to the HTML output.
+- Tables use `write_tab()` and keep complete numeric precision.
+- Do not rename existing output stems; manuscript mapping depends on them.
+- `manifests/output_manifest.tsv` defines the expected output set.
 
-- 每行 `Material_Description2.csv` 的 `Subplot` 输出一个独立文件；单行多面板图（FigS1、FigS2、FigS9、FigS12）按整图输出。
-- 文件名 = `Subplot_Short_English_Description.pdf/.jpg`，例如 `Fig1A_Global_sample_distribution_map.pdf`。
-- 图内不嵌 A/B/C 面板字母；最终拼版在 Illustrator 完成。
-- 统一用 `save_panel()` 输出 PDF + 300 dpi JPG；不另建多套 `save_fig`。
-- 非稿件诊断图放 `results/diagnostics/`，用 `diagnostic_` 前缀。
+- 图件用 `save_fig()` 输出 PDF+JPG；第三章沿用原 stem 并关闭命名检查。
+- 每张图随后用 `embed_fig()` 原位嵌入渲染文档，使用 JPG 与相对 HTML 的路径。
+- 表格用 `write_tab()`，保留完整数值精度。
+- 不重命名现有输出 stem；稿件映射依赖这些名称。
+- 期望输出集合见 `manifests/output_manifest.tsv`。
 
-## 表格 / Tables
+## Verification / 验证
 
-- 稿件表统一命名 `Table S1.xlsx`–`Table S7.xlsx`；Table S7 为审核后的预测覆盖率表，按当前文件名复制。
-- Table S1 是人工整理输入；Table S2/S3 由数据集章节生成，Table S4 由宿主系统发育章节生成，Table S5 由 GOS 分类表生成，Table S6 由 16S 性状表生成。
+- After changing a chapter, render it and compare tables against the reference
+  with `scripts/tools/compare_results.py` (numeric tolerance, not file hash).
+- A full clean run from an empty `result/` is the acceptance test.
+- Missing or mismatching outputs are errors, not warnings to ignore.
 
-## 修改与验收 / Change control
-
-- 修改前备份；科学方法或结论变更须作者确认。
-- 重构后用 `scripts/tools/check_outputs.py` 检查 84 行图表输出清单是否齐全，并对关键结果表做数值对齐。
-- 不通过观察 JPG/TIF 判断结论；图件只检查底层数据和文件完整性。
+- 修改章节后渲染，并用 `compare_results.py` 按数值容差比对参考结果。
+- 从空 `result/` 完整运行是验收标准。
+- 输出缺失或数值不一致按错误处理。

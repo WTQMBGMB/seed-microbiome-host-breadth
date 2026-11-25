@@ -2,7 +2,7 @@ cff-version: 1.2.0
 message: "Please cite this software archive, the companion dataset, and the associated paper."
 type: software
 title: "Host-associated community structure and microbial host breadth in the seed microbiome: analysis code"
-version: "1.0.0"
+version: "2.0.0"
 license: MIT
 authors:
   - family-names: "Wang"
@@ -20,25 +20,3 @@ authors:
   - family-names: "Ling"
     given-names: "Ning"
 repository-code: "https://github.com/WTQMBGMB/seed-microbiome-host-breadth"
-references:
-  - type: data
-    title: "Host-associated community structure and microbial host breadth in the seed microbiome: processed analysis data"
-    version: "1.0.0"
-    doi: "10.5281/zenodo.24241936"
-    authors:
-      - family-names: "Wang"
-        given-names: "Zilong"
-      - family-names: "Ai"
-        given-names: "Wenfeng"
-      - family-names: "Li"
-        given-names: "Xiangyu"
-      - family-names: "Xu"
-        given-names: "Ying"
-      - family-names: "He"
-        given-names: "Peng"
-      - family-names: "Ma"
-        given-names: "Tengfei"
-      - family-names: "Ling"
-        given-names: "Ning"
-doi: "10.5281/zenodo.24242501"
-date-released: "2026-11-15"

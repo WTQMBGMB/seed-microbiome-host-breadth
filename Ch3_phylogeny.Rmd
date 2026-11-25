@@ -1,0 +1,1568 @@
+---
+title: "Chapter 3 - Host phylogeny and seed microbiome"
+output:
+  html_document:
+    toc: false
+    self_contained: false
+params:
+  force_recompute: false
+  rebuild_asv: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = TRUE, warning = TRUE,
+  fig.show = "hide", comment = "#>"
+)
+source(file.path(normalizePath(getwd(), winslash = "/"), "R", "config.R"))
+source(file.path(PROJECT_ROOT, "R", "common.R"))
+suppressMessages({
+  library(data.table)
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(ape)
+  library(vegan)
+  library(ecodist)
+  library(phytools)
+  library(ggtree)
+  library(ggtreeExtra)
+  library(patchwork)
+  library(grid)
+})
+ensure_v2_dirs()
+CHAPTER <- "ch3_phylogeny"
+FORCE <- isTRUE(params$force_recompute)
+# Mapped-bin ASV analysis is CPU-heavy; server backend tables are reused by
+# default and params$rebuild_asv = TRUE recomputes them from the cache.
+# ASV 分析耗时；默认复用服务器后端表，rebuild_asv = TRUE 时从缓存重算。
+REBUILD_ASV <- isTRUE(params$rebuild_asv)
+progress <- make_progress(CHAPTER)
+# Chapter 3 keeps its original figure stems (not Fig_<n>_); use the shared
+# writer with the stem check disabled. / Ch3 图名沿用原 stem，关闭命名检查。
+save_fig_ch3 <- function(p, stem, width_in, height_in, dpi = 300) {
+  d <- ch_dir(CHAPTER, "figures")
+  ggplot2::ggsave(file.path(d, paste0(stem, ".pdf")), p,
+                  width = width_in, height = height_in, units = "in",
+                  device = grDevices::cairo_pdf, bg = "white")
+  ggplot2::ggsave(file.path(d, paste0(stem, ".jpg")), p,
+                  width = width_in, height = height_in, units = "in",
+                  device = ragg::agg_jpeg, dpi = dpi, quality = 95,
+                  bg = "white")
+  invisible(file.path(d, stem))
+}
+```
+
+# 1. Data and shared helpers / 数据与公共函数
+
+The three main regions are the same as in Chapters 1–2 (V4, V5–V7, ITS1).
+Each region keeps its own host **species** tree (`data/plant_tree/plant_species_tree_*.nwk`);
+the region CSS table is aligned to the cleaned metadata (`SampleID` is not unique
+across kingdoms, so the match is always done within `dataset`).
+
+```{r data}
+REG3 <- c("v4", "v5_v7", "its1")
+REG_CFG <- list(
+  v4    = list(css = "css_v4_asvtab.txt", ds = "16S", rf = "V4",
+               tree = "plant_species_tree_v4.nwk"),
+  v5_v7 = list(css = "css_v5_v7_asvtab.txt", ds = "16S", rf = "V5_V7",
+               tree = "plant_species_tree_v5_v7.nwk"),
+  its1  = list(css = "css_its1_asvtab.txt", ds = "ITS", rf = "ITS1",
+               tree = "plant_species_tree_its1.nwk")
+)
+REG_LAB <- c(v4 = "V4", v5_v7 = "V5–V7", its1 = "ITS1")
+
+md_all <- read_all_meta()
+
+load_region_data <- function(region, verbose = TRUE) {
+  cfg <- REG_CFG[[region]]
+  raw <- fread(css_region_path(region, cfg$css))
+  asv_ids <- as.character(raw[[1]])
+  otu <- t(as.matrix(raw[, -1, with = FALSE]))
+  colnames(otu) <- asv_ids
+  rownames(otu) <- names(raw)[-1]
+  rm(raw); invisible(gc())
+
+  meta <- md_all[dataset == cfg$ds & SampleID %in% rownames(otu)]
+  meta <- meta[match(rownames(otu), meta$SampleID)]
+  stopifnot(nrow(meta) == nrow(otu), identical(meta$SampleID, rownames(otu)))
+  meta <- as.data.frame(meta)
+
+  tree <- ape::read.tree(host_tree_path(cfg$tree))
+  sp_meta <- unique(meta$species[!is.na(meta$species) & meta$species != ""])
+  dropped <- setdiff(tree$tip.label, sp_meta)
+  if (length(dropped)) tree <- ape::drop.tip(tree, dropped)
+  if (verbose) {
+    cat(sprintf("%s: %d samples x %d ASVs; tree tips %d (dropped %d); region %s\n",
+                region, nrow(otu), ncol(otu), length(tree$tip.label),
+                length(dropped), cfg$rf))
+  }
+  list(otu = otu, meta = meta, tree = tree, region = region)
+}
+
+dat <- setNames(lapply(REG3, load_region_data), REG3)
+```
+
+```{r helpers}
+# ---- alpha diversity (identical formula to R/alpha_boxplot.R) ----
+calc_alpha_div <- function(otu) {
+  if (!is.matrix(otu)) otu <- as.matrix(otu)
+  shannon  <- vegan::diversity(otu, index = "shannon", MARGIN = 1)
+  observed <- rowSums(otu > 0)
+  simpson  <- vegan::diversity(otu, index = "simpson", MARGIN = 1)
+  pielou   <- ifelse(observed > 1, shannon / log(observed), NA_real_)
+  data.frame(SampleID = rownames(otu), Shannon = unname(shannon),
+             Simpson = unname(simpson), Observed = unname(observed),
+             Pielou = unname(pielou), stringsAsFactors = FALSE)
+}
+
+# ---- group-mean distance matrix ----
+mean_dist <- function(indata, classify_df) {
+  if (inherits(indata, "dist")) indata <- as.matrix(indata)
+  colnames(classify_df) <- c("SampleID", "groups")
+  common <- intersect(rownames(indata), classify_df$SampleID)
+  classify_df <- classify_df[classify_df$SampleID %in% common, , drop = FALSE]
+  indata <- indata[common, common, drop = FALSE]
+  groups <- unique(classify_df$groups)
+  gm <- matrix(1, ncol = length(groups), nrow = length(groups),
+               dimnames = list(groups, groups))
+  for (i in seq_along(groups)) {
+    ri <- classify_df$SampleID[classify_df$groups == groups[i]]
+    for (j in seq_along(groups)) {
+      cj <- classify_df$SampleID[classify_df$groups == groups[j]]
+      gm[i, j] <- mean(indata[ri, cj, drop = FALSE])
+    }
+  }
+  gm
+}
+
+.fmt_p <- function(p) {
+  if (is.na(p)) return("NA")
+  if (p < 0.001) return("<0.001")
+  sprintf("%.3f", p)
+}
+
+# ---- Mantel + MRM + dbRDA on species-mean microbial distance ----
+mantel_mrm_analysis <- function(data, bray_dist = NULL) {
+  otu <- data$otu; meta <- data$meta; tree <- data$tree
+  if (is.null(bray_dist)) bray_dist <- vegan::vegdist(otu, method = "bray")
+  bray_matrix <- as.matrix(bray_dist)
+  tree_matrix <- stats::cophenetic(tree)
+  species_matrix <- mean_dist(bray_matrix, meta[, c("SampleID", "species")])
+  common_sp <- intersect(rownames(tree_matrix), rownames(species_matrix))
+  if (length(common_sp) < 10) return(NULL)
+  tree_mat <- tree_matrix[common_sp, common_sp]
+  sp_mat   <- species_matrix[common_sp, common_sp]
+
+  # Permutation P values are seeded per region so re-rendering the chapter
+  # reproduces the same numbers.
+  reg_seed <- 20261121L + 10L * match(data$region, REG3)
+  set.seed(reg_seed)
+  mantel_res <- vegan::mantel(tree_mat, sp_mat, method = "pearson",
+                              permutations = 999)
+  set.seed(reg_seed + 1L)
+  mrm_res <- ecodist::MRM(as.dist(sp_mat) ~ as.dist(tree_mat), nperm = 999)
+  pcoa_tree <- cmdscale(tree_mat, k = min(5, nrow(tree_mat) - 1), eig = TRUE)
+  dbrda_res <- vegan::capscale(sp_mat ~ ., data = as.data.frame(pcoa_tree$points))
+  set.seed(reg_seed + 2L)
+  dbrda_anova <- anova(dbrda_res, permutations = 999)
+
+  idx <- upper.tri(tree_mat)
+  df_plot <- data.frame(phylo = tree_mat[idx], micro = sp_mat[idx])
+  is_its <- grepl("its", data$region, ignore.case = TRUE)
+  pt_color <- if (is_its) "#81B29A" else "#4E79A7"
+  lab <- sprintf("Mantel r = %.3f\nP = %s\n\nMRM R² = %.3f\nP = %s",
+                 mantel_res$statistic, .fmt_p(mantel_res$signif),
+                 mrm_res$r.squared[1], .fmt_p(mrm_res$r.squared[2]))
+  p <- ggplot(df_plot, aes(phylo, micro)) +
+    geom_point(color = pt_color, alpha = 0.2, size = 1.2) +
+    geom_smooth(method = "lm", color = pt_color, se = FALSE, linewidth = 1.2) +
+    annotate("text", x = Inf, y = -Inf, label = lab,
+             hjust = 1.05, vjust = -0.2, size = 3.5) +
+    theme_bw(base_size = 12) +
+    theme(panel.grid = element_blank(),
+          plot.title = element_text(face = "bold", size = 13)) +
+    labs(title = sprintf("Mantel & MRM (%s)", data$region),
+         x = "Host phylogenetic distance",
+         y = "Microbial community dissimilarity (Bray-Curtis)")
+
+  list(region = data$region,
+       mantel_r = mantel_res$statistic, mantel_p = mantel_res$signif,
+       mrm_r2 = mrm_res$r.squared[1], mrm_r2p = mrm_res$r.squared[2],
+       mrm_F = mrm_res$F.test[1], mrm_Fp = mrm_res$F.test[2],
+       dbrda_r2 = sum(dbrda_res$CCA$eig) / dbrda_res$tot.chi,
+       dbrda_p = dbrda_anova$`Pr(>F)`[1],
+       n_species = length(common_sp),
+       plot_mantel = p, bray_dist = bray_dist)
+}
+```
+
+## 1.1 Unified host Order colours / 统一宿主目配色
+
+The Order palette is the Chapter 1 host-tree mapping
+(`result/ch1_dataset/tree/host_order_colors.tsv`). Two Orders that occur in
+the region tables but are absent from the host tree (Proteales, Malpighiales)
+receive the next `PAL_MULTI` colours, as in Chapter 2.
+
+```{r order-colours}
+ocm <- fread(file.path(tree_dir("ch1_dataset"), "host_order_colors.tsv"))
+ord_col <- setNames(ocm$colour, ocm$Order)
+
+ord_present <- sort(unique(unlist(lapply(dat, function(d) d$meta$Order))))
+ord_present <- ord_present[!is.na(ord_present) & ord_present != ""]
+extra <- setdiff(ord_present, names(ord_col))
+ord_col_all <- setNames(ord_col[intersect(ord_present, names(ord_col))],
+                        intersect(ord_present, names(ord_col)))
+if (length(extra)) {
+  ord_col_all[extra] <- PAL_MULTI[nrow(ocm) + seq_along(extra)]
+}
+ord_lev <- c(ocm$Order[ocm$Order %in% ord_present], extra)
+ord_col_all <- ord_col_all[ord_lev]
+stopifnot(!anyNA(ord_col_all), !anyDuplicated(ord_col_all))
+cat("Orders in data:", length(ord_lev),
+    "| fallback colours:", paste(extra, collapse = ", "), "\n")
+
+# Shared legend helper from the original pipeline / 复用原流程的图例函数
+tools_env <- new.env(parent = globalenv())
+sys.source(file.path(PROJECT_ROOT, "R", "plot_helpers.R"), envir = tools_env)
+legend_plot <- tools_env$create_color_legend(
+  data.frame(category = ord_lev, color = unname(ord_col_all)),
+  shape = "circle", layout = "col", n = 13, title = "Host Order",
+  label_size = 4, title_size = 6, ifsave = FALSE)
+# create_color_legend() leaves the rightmost label outside its x limits when
+# 13 columns carry long Order names; widen the limits so the last column is
+# not clipped when the legend is stacked under the three panels.
+leg_ncol <- 13L
+leg_w    <- 1.5 + floor(max(nchar(ord_lev)) / 5)
+leg_xmax <- (leg_ncol - 1L) * leg_w + 1 + 0.3 * leg_ncol + 2
+legend_plot <- suppressMessages(
+  legend_plot + ggplot2::coord_cartesian(xlim = c(0.7, leg_xmax)))
+```
+
+# 2. Host phylogenetic signal of alpha diversity / α 多样性的宿主系统发育信号
+
+For each region and each index (Shannon on the raw scale, Observed on the
+log10 scale) we fit Blomberg's K and Pagel's λ on the host species tree, then
+draw the circular host tree with an outer ring of species-mean diversity.
+
+```{r phylo-alpha}
+if (!requireNamespace("ggtreeExtra", quietly = TRUE)) {
+  stop("ggtreeExtra is required")
+}
+
+PHYLO_SEED <- 20261119L
+
+phylo_alpha_plot <- function(data, alpha_idx = "Shannon",
+                             color_map = NULL, show_species = FALSE,
+                             legend_pos = "none", fill_limits = NULL,
+                             log10_transform = FALSE, seed = NULL) {
+  otu <- data$otu; meta <- data$meta; tree <- data$tree
+  alpha_df <- calc_alpha_div(otu)
+  alpha_df <- merge(alpha_df,
+                    meta[, c("SampleID", "species", "Order", "Family", "Genus")],
+                    by = "SampleID", all.x = TRUE)
+  alpha_df <- alpha_df[alpha_df$species %in% tree$tip.label, ]
+
+  alpha_sp <- alpha_df %>%
+    dplyr::group_by(species) %>%
+    dplyr::summarise(
+      mean_val = mean(.data[[alpha_idx]], na.rm = TRUE),
+      se_val = if (dplyr::n() > 1) sd(.data[[alpha_idx]], na.rm = TRUE) / sqrt(dplyr::n()) else NA_real_,
+      n_sample = dplyr::n(),
+      Order = dplyr::first(Order),
+      Family = dplyr::first(Family),
+      .groups = "drop")
+  alpha_sp <- as.data.frame(alpha_sp)
+  rownames(alpha_sp) <- alpha_sp$species
+
+  tips_in_tree <- tree$tip.label
+  trait <- setNames(alpha_sp[tips_in_tree, "mean_val"], tips_in_tree)
+  trait <- trait[!is.na(trait)]
+  if (length(trait) < length(tree$tip.label)) {
+    tree <- ape::drop.tip(tree, setdiff(tree$tip.label, names(trait)))
+  }
+
+  sig_trait <- trait; tree_sig <- tree
+  if (log10_transform) {
+    sig_trait <- log10(sig_trait)
+    keep <- is.finite(sig_trait)
+    if (!all(keep)) {
+      sig_trait <- sig_trait[keep]
+      tree_sig <- ape::drop.tip(tree, setdiff(tree$tip.label, names(sig_trait)))
+    }
+  }
+  # Blomberg's K P value uses random permutations inside phytools::phylosig;
+  # fix the seed so re-rendering the chapter does not move the reported P.
+  if (!is.null(seed)) set.seed(seed)
+  ps_K <- tryCatch(phytools::phylosig(tree_sig, sig_trait[tree_sig$tip.label],
+                                      method = "K", test = TRUE),
+                   error = function(e) NULL)
+  ps_L <- tryCatch(phytools::phylosig(tree_sig, sig_trait[tree_sig$tip.label],
+                                      method = "lambda", test = TRUE),
+                   error = function(e) NULL)
+
+  scale_tag <- if (log10_transform) " (log10)" else ""
+  sub_lines <- character(0)
+  if (!is.null(ps_K))
+    sub_lines <- c(sub_lines, sprintf("Blomberg's K%s = %.3f, P = %s",
+                                      scale_tag, ps_K$K, .fmt_p(ps_K$P)))
+  if (!is.null(ps_L))
+    sub_lines <- c(sub_lines, sprintf("Pagel's lambda%s = %.3f, P = %s",
+                                      scale_tag, ps_L$lambda, .fmt_p(ps_L$P)))
+
+  tip_order <- alpha_sp[tree$tip.label, "Order"]
+  tip_order[is.na(tip_order)] <- "Unknown"
+  tip_data <- data.frame(label = tree$tip.label, Order = tip_order,
+                         stringsAsFactors = FALSE)
+  bar_data <- alpha_sp[tree$tip.label, c("species", "mean_val")]
+  bar_data$species <- factor(bar_data$species, levels = tree$tip.label)
+
+  bar_axis_title <- alpha_idx
+  if (log10_transform) {
+    bar_data <- bar_data[bar_data$mean_val > 0, , drop = FALSE]
+    bar_data$mean_val <- log10(bar_data$mean_val)
+    bar_axis_title <- sprintf("log10(%s)", alpha_idx)
+  }
+
+  p_tree <- ggtree::ggtree(tree, layout = "circular", size = 0.4) %<+% tip_data +
+    ggtree::geom_tippoint(ggplot2::aes(color = Order), size = 1.5)
+  if (show_species) {
+    p_tree <- p_tree +
+      ggtree::geom_tiplab(ggplot2::aes(label = gsub("_", " ", label)),
+                          size = 1.8, offset = 0.15, fontface = "italic")
+  }
+  if (!is.null(color_map) && !is.null(color_map$order)) {
+    p_tree <- p_tree +
+      ggplot2::scale_color_manual(values = color_map$order, na.value = "grey70")
+  }
+
+  p <- p_tree +
+    ggtreeExtra::geom_fruit(
+      data = bar_data, geom = geom_col,
+      mapping = ggplot2::aes(y = species, x = mean_val, fill = mean_val),
+      orientation = "y", width = 0.7, offset = 0.08, pwidth = 0.25,
+      axis.params = list(axis = "x", title = bar_axis_title,
+                         text.size = 1.5, title.size = 2.5)) +
+    ggplot2::scale_fill_gradient(low = "#F7E09B", high = "#3A5A40",
+                                 name = bar_axis_title, limits = fill_limits,
+                                 guide = ggplot2::guide_colourbar(
+                                   title.position = "top",
+                                   barwidth = 8, barheight = 0.8)) +
+    ggplot2::labs(
+      title = sprintf("Host Phylogeny & %s Diversity (%s)",
+                      alpha_idx, data$region),
+      subtitle = paste(sub_lines, collapse = "; ")) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(face = "bold", size = 14, hjust = 0.5),
+      plot.subtitle = ggplot2::element_text(size = 9, hjust = 0.5,
+                                            color = "grey40"),
+      legend.position = legend_pos)
+
+  invisible(list(plot = p, phylosig_K = ps_K, phylosig_L = ps_L,
+                 alpha_species = alpha_sp))
+}
+
+colour_map <- list(order = ord_col_all)
+FILL_LIMITS <- list(Shannon = c(0, 6), Observed = c(0, 3.2))
+INDICES <- c("Shannon", "Observed")
+
+phylosig_rows <- list(); k <- 0L
+alpha_panels <- list()
+alpha_stems <- character()
+for (idx in INDICES) {
+  lim <- FILL_LIMITS[[idx]]
+  panels <- list()
+  for (reg in REG3) {
+    res <- phylo_alpha_plot(dat[[reg]], alpha_idx = idx, color_map = colour_map,
+                            fill_limits = lim,
+                            log10_transform = (idx == "Observed"),
+                            seed = PHYLO_SEED + 10L * match(reg, REG3) +
+                                   match(idx, INDICES))
+    panels[[reg]] <- res$plot
+    k <- k + 1L
+    phylosig_rows[[k]] <- data.frame(
+      Region = reg,
+      K = if (!is.null(res$phylosig_K)) res$phylosig_K$K else NA_real_,
+      K_P = if (!is.null(res$phylosig_K)) res$phylosig_K$P else NA_real_,
+      Lambda = if (!is.null(res$phylosig_L)) res$phylosig_L$lambda else NA_real_,
+      Lambda_P = if (!is.null(res$phylosig_L)) res$phylosig_L$P else NA_real_,
+      Alpha_Index = idx,
+      Trait_Scale = if (idx == "Observed") "log10" else "raw",
+      stringsAsFactors = FALSE)
+  }
+  alpha_panels[[idx]] <- panels
+  p_comb <- patchwork::wrap_plots(panels, nrow = 1) / legend_plot +
+    patchwork::plot_layout(heights = c(7, 1))
+  stem <- sprintf("phylo_alpha_combined_%s", tolower(idx))
+  save_fig_ch3(p_comb, stem, 24, 11)
+  alpha_stems <- c(alpha_stems, stem)
+  progress("phylo_alpha_combined_", tolower(idx), " done")
+}
+embed_fig(CHAPTER, alpha_stems)
+
+phylosig_tab <- do.call(rbind, phylosig_rows)
+write_tab(phylosig_tab, CHAPTER, "Tab_3_phylosig")
+knitr::kable(phylosig_tab, digits = 4,
+             caption = "Host phylogenetic signal of alpha diversity (Blomberg's K, Pagel's lambda; Observed on log10 scale)")
+```
+
+# 3. Bootstrap confidence intervals for Pagel's λ / λ 的 bootstrap 置信区间
+
+Species-level bootstrap (resample samples within each species, B = 500) of the
+λ MLE; the density figure shows the bootstrap distribution per region × index.
+
+```{r lambda-boot}
+CACHE <- file.path(rds_dir(CHAPTER), "boot_lambda_samples.rds")
+
+B <- 500L
+SEED <- 123L
+IDX_LABEL <- c(Shannon = "Shannon", Observed = "Observed (log10)")
+KGD <- c(v4 = "Bacteria", v5_v7 = "Bacteria", its1 = "Fungi")
+RLAB <- c(v4 = "16S V4", v5_v7 = "16S V5-V7", its1 = "ITS1")
+CACHE_TAG <- "obs_log10_v1"
+
+boot_dat <- setNames(lapply(REG3, function(reg) {
+  d <- dat[[reg]]
+  ad <- calc_alpha_div(d$otu)
+  ad$species <- d$meta$species[match(ad$SampleID, d$meta$SampleID)]
+  ad <- ad[!is.na(ad$species) & ad$species %in% d$tree$tip.label, ]
+  list(tree = d$tree, alpha = ad)
+}), REG3)
+
+boot_lambda <- function(splits, tree, B, seed, log10_trait = FALSE) {
+  n_tip <- Ntip(tree)
+  boot_one <- function(b, splits, tree, n_tip, seed, log10_trait) {
+    set.seed(seed + b)
+    m <- vapply(splits, function(x) mean(sample(x, length(x), replace = TRUE)),
+                numeric(1), USE.NAMES = TRUE)
+    if (log10_trait) m <- log10(m)
+    tr <- setNames(m[tree$tip.label], tree$tip.label)
+    tr <- tr[is.finite(tr)]
+    tt <- tree
+    if (length(tr) < n_tip)
+      tt <- ape::drop.tip(tree, setdiff(tree$tip.label, names(tr)))
+    tryCatch(phytools::phylosig(tt, tr[tt$tip.label], method = "lambda")$lambda,
+             error = function(e) NA_real_)
+  }
+  nc <- max(1L, min(parallel::detectCores() - 2, 8))
+  cl <- parallel::makeCluster(nc)
+  on.exit(parallel::stopCluster(cl))
+  parallel::clusterEvalQ(cl, { library(ape); library(phytools); NULL })
+  tryCatch(
+    as.numeric(parallel::parSapply(cl, seq_len(B), boot_one,
+                                   splits = splits, tree = tree,
+                                   n_tip = n_tip, seed = seed,
+                                   log10_trait = log10_trait)),
+    error = function(e) vapply(seq_len(B), boot_one, numeric(1),
+                               splits = splits, tree = tree, n_tip = n_tip,
+                               seed = seed, log10_trait = log10_trait))
+}
+
+boot_samples <- if (file.exists(CACHE) && !FORCE) {
+  bs <- readRDS(CACHE)
+  if (identical(attr(bs, "cache_tag"), CACHE_TAG)) {
+    cat("loaded bootstrap cache:", CACHE, "\n"); bs
+  } else list()
+} else list()
+
+rows <- list(); k <- 0L
+for (reg in REG3) {
+  d <- boot_dat[[reg]]
+  for (idx in INDICES) {
+    splits <- split(d$alpha[[idx]], d$alpha$species)
+    trait0 <- setNames(vapply(splits, mean, numeric(1), na.rm = TRUE),
+                       names(splits))
+    log10_trait <- idx == "Observed"
+    if (log10_trait) trait0 <- log10(trait0)
+    trait0 <- trait0[d$tree$tip.label]; trait0 <- trait0[is.finite(trait0)]
+    tt <- d$tree
+    if (length(trait0) < Ntip(tt))
+      tt <- ape::drop.tip(tt, setdiff(tt$tip.label, names(trait0)))
+    trait0 <- trait0[tt$tip.label]
+    # same seed as the figure chunk so both tables report the same K P value
+    set.seed(PHYLO_SEED + 10L * match(reg, REG3) + match(idx, INDICES))
+    fitK <- tryCatch(phytools::phylosig(tt, trait0, method = "K", test = TRUE),
+                     error = function(e) NULL)
+    fitL <- tryCatch(phytools::phylosig(tt, trait0, method = "lambda", test = TRUE),
+                     error = function(e) NULL)
+
+    key <- paste0(reg, "_", idx)
+    if (key %in% names(boot_samples)) {
+      lam_b <- boot_samples[[key]]
+    } else {
+      t0 <- proc.time()
+      lam_b <- boot_lambda(splits, d$tree, B, SEED + k,
+                           log10_trait = log10_trait)
+      lam_b <- lam_b[is.finite(lam_b)]
+      boot_samples[[key]] <- lam_b
+      cat(sprintf("  %s | %-8s B=%d ok=%d %.1fs\n", reg, idx, B,
+                  length(lam_b), (proc.time() - t0)[3]))
+    }
+    k <- k + 1L
+    rows[[k]] <- data.frame(
+      region = reg, kingdom = KGD[[reg]], region_label = RLAB[[reg]],
+      index = idx, trait_scale = if (log10_trait) "log10" else "raw",
+      combo = sprintf("%s . %s", RLAB[[reg]], IDX_LABEL[[idx]]),
+      lambda = if (!is.null(fitL)) fitL$lambda else NA_real_,
+      lambda_P = if (!is.null(fitL)) fitL$P else NA_real_,
+      K = if (!is.null(fitK)) fitK$K else NA_real_,
+      K_P = if (!is.null(fitK)) fitK$P else NA_real_,
+      ci_low = as.numeric(quantile(lam_b, 0.025)),
+      ci_high = as.numeric(quantile(lam_b, 0.975)),
+      n_species = length(trait0), n_boot = length(lam_b),
+      stringsAsFactors = FALSE)
+  }
+}
+attr(boot_samples, "cache_tag") <- CACHE_TAG
+saveRDS(boot_samples, CACHE)
+
+lam_tab <- do.call(rbind, rows)
+lam_tab$ci_low  <- ifelse(lam_tab$ci_low < 0.001, 0, lam_tab$ci_low)
+lam_tab$ci_high <- pmin(1, lam_tab$ci_high)
+lam_tab$lambda  <- pmax(0, lam_tab$lambda)
+lam_tab$contains_zero <- lam_tab$ci_low <= 0.001
+write_tab(lam_tab, CHAPTER, "Tab_3_lambda_ci")
+knitr::kable(lam_tab[, c("combo", "lambda", "ci_low", "ci_high",
+                         "contains_zero", "lambda_P", "K_P")], digits = 4,
+             caption = "Pagel's lambda with species-level bootstrap 95% CI (B = 500); Observed on log10 scale")
+```
+
+```{r fig-lambda-density}
+dens_list <- list()
+for (nm in names(boot_samples)) {
+  parts <- strsplit(nm, "_", fixed = TRUE)[[1]]
+  reg <- paste(parts[-length(parts)], collapse = "_")
+  idx <- parts[length(parts)]
+  dens_list[[nm]] <- data.frame(region = RLAB[[reg]], index = idx,
+                                lambda = boot_samples[[nm]],
+                                stringsAsFactors = FALSE)
+}
+dens <- do.call(rbind, dens_list)
+dens$region_lab <- factor(
+  ifelse(dens$region == "16S V5-V7", "V5–V7",
+         ifelse(dens$region == "ITS1", "ITS1", "V4")),
+  levels = c("V4", "V5–V7", "ITS1"))
+dens$index_lab <- factor(IDX_LABEL[dens$index],
+                         levels = unname(IDX_LABEL[c("Shannon", "Observed")]))
+PANEL_LEVELS <- c("V4 · Shannon", "V5–V7 · Shannon", "ITS1 · Shannon",
+                  "V4 · Observed (log10)", "V5–V7 · Observed (log10)",
+                  "ITS1 · Observed (log10)")
+dens$panel_lab <- factor(sprintf("%s · %s", dens$region_lab, dens$index_lab),
+                         levels = PANEL_LEVELS)
+dens$kg <- ifelse(dens$region == "ITS1", "Fungi", "Bacteria")
+
+obs_line <- lam_tab[, c("combo", "lambda", "ci_low", "ci_high")]
+obs_line$region_lab <- factor(
+  ifelse(grepl("V5-V7", obs_line$combo), "V5–V7",
+         ifelse(grepl("ITS1", obs_line$combo), "ITS1", "V4")),
+  levels = c("V4", "V5–V7", "ITS1"))
+obs_line$index_lab <- factor(
+  ifelse(grepl("Shannon", obs_line$combo), "Shannon", "Observed (log10)"),
+  levels = c("Shannon", "Observed (log10)"))
+obs_line$panel_lab <- factor(
+  sprintf("%s · %s", obs_line$region_lab, obs_line$index_lab),
+  levels = PANEL_LEVELS)
+
+p_dens <- ggplot(dens, aes(x = lambda)) +
+  geom_histogram(aes(fill = kg), bins = 40, colour = "white", linewidth = 0.15) +
+  geom_vline(data = obs_line, aes(xintercept = ci_low), linetype = "dashed",
+             colour = "grey40") +
+  geom_vline(data = obs_line, aes(xintercept = ci_high), linetype = "dashed",
+             colour = "grey40") +
+  geom_vline(data = obs_line, aes(xintercept = lambda), colour = "black",
+             linewidth = 0.6) +
+  scale_fill_manual(values = c(Bacteria = "#0072B2", Fungi = "#D55E00"),
+                    guide = "none") +
+  facet_wrap(~ panel_lab, nrow = 2, scales = "free_y") +
+  labs(x = "Bootstrap Pagel's lambda", y = "Count") +
+  theme_bw(base_size = 11) +
+  theme(strip.background = element_rect(fill = "grey92"))
+save_fig_ch3(p_dens, "fig_lambda_boot_density", 9, 5.5)
+embed_fig(CHAPTER, "fig_lambda_boot_density")
+progress("fig_lambda_boot_density done")
+```
+
+# 4. Permutation nulls: is the signal beyond study structure? / 置换零模型
+
+Permutation unit = study (`source`) × species group. For α:
+`before_global` shuffles species labels across groups (keeping group sizes and
+weights), `after_free` shuffles species means freely (the standard phylosig
+null). For β, a group-level Mantel r is compared with 999 permutations of
+species labels. Seeds, grouping and estimation are identical to the original
+implementation (`phylo_confound_permutation.R`). The α and β nulls are shown
+in one 4-column figure (`Fig_phylo_permutation_summary`).
+
+```{r permutation}
+PERM_CACHE <- file.path(rds_dir(CHAPTER), "phylo_confound.rds")
+B_PERM <- 999L
+IDX_LAB <- c(Shannon = "Shannon", Observed = "Observed (log10)")
+
+if (!file.exists(PERM_CACHE) || FORCE) {
+  set.seed(20261106)
+  N_CORES <- max(1L, min(parallel::detectCores() - 2L, 32L))
+  CL <- parallel::makeCluster(N_CORES)
+  parallel::clusterEvalQ(CL, {
+    suppressPackageStartupMessages({ library(data.table); library(ape); library(phytools) })
+    NULL
+  })
+  cat(sprintf("parallel workers: %d\n", N_CORES))
+
+  agg_trait <- function(labels, means, ns) {
+    dt <- data.table(label = labels, m = means, n = ns)
+    dt[, .(trait = sum(m * n) / sum(n)), by = label]
+  }
+  lambda_fit <- function(tree, trait_dt, log10_trait = FALSE) {
+    tr <- tryCatch(keep.tip(tree, trait_dt$label), error = function(e) NULL)
+    if (is.null(tr) || Ntip(tr) < 4L) return(NA_real_)
+    x <- setNames(trait_dt$trait, trait_dt$label)[tr$tip.label]
+    if (log10_trait) x <- log10(x)
+    if (any(!is.finite(x))) return(NA_real_)
+    tryCatch(phytools::phylosig(tr, x, method = "lambda")$lambda,
+             error = function(e) NA_real_)
+  }
+  mantel_r <- function(d1, d2) { lt <- lower.tri(d1); cor(d1[lt], d2[lt]) }
+  summ_null <- function(obs, null) {
+    null <- null[is.finite(null)]
+    data.table(observed = obs, null_mean = mean(null),
+               null_q05 = as.numeric(quantile(null, 0.05)),
+               null_q95 = as.numeric(quantile(null, 0.95)),
+               null_min = min(null), null_max = max(null),
+               p_one_sided = (1 + sum(null >= obs)) / (length(null) + 1),
+               n_valid = length(null))
+  }
+
+  perm_before_global <- function(b) tryCatch({
+    set.seed(seed_base + b)
+    lab <- sample(gdt$species)
+    td <- agg_trait(lab, trait_raw, gdt$n)
+    lambda_fit(tree, td, log10_trait)
+  }, error = function(e) NA_real_)
+  perm_after_free <- function(b) tryCatch({
+    set.seed(seed_base + b)
+    xp <- sample(sp_trait_l)
+    lambda_fit(tree, data.table(label = names(sp_trait_l), trait = xp),
+               log10_trait = FALSE)
+  }, error = function(e) NA_real_)
+  perm_beta_global <- function(b) tryCatch({
+    set.seed(seed_base + b)
+    lab <- sample(gdt$species)
+    mantel_r(comm, host_full[lab, lab])
+  }, error = function(e) NA_real_)
+
+  prep_region <- function(reg) {
+    d <- dat[[reg]]
+    bd <- readRDS(bray_path(reg))
+    labs <- attr(bd, "Labels")
+    meta <- as.data.frame(d$meta[match(labs, d$meta$SampleID), ])
+    otu  <- d$otu[match(labs, rownames(d$otu)), , drop = FALSE]
+    ad   <- calc_alpha_div(otu)
+    meta$Shannon  <- ad$Shannon[match(labs, ad$SampleID)]
+    meta$Observed <- ad$Observed[match(labs, ad$SampleID)]
+    meta$source   <- as.character(meta$source)
+    meta$species  <- as.character(meta$species)
+    keep <- !is.na(meta$species) & meta$species %in% d$tree$tip.label &
+            !is.na(meta$source) & meta$source != "" &
+            is.finite(meta$Shannon) & is.finite(meta$Observed)
+    if (sum(keep) < 20L) stop(reg, ": too few samples")
+    meta <- meta[keep, , drop = FALSE]
+    bd   <- as.dist(as.matrix(bd)[keep, keep])
+    labs <- labs[keep]
+    meta$group <- paste(meta$source, meta$species, sep = "||")
+    gdt <- as.data.table(meta)[, .(
+      n = .N, Shannon = mean(Shannon), Observed = mean(Observed),
+      species = species[1], source = source[1]), by = group]
+    comm <- mean_dist(as.matrix(bd),
+                      data.frame(SampleID = labs, groups = meta$group))
+    comm <- comm[gdt$group, gdt$group]
+    tree_sp <- keep.tip(d$tree, unique(gdt$species))
+    host_full <- cophenetic(tree_sp)
+    list(reg = reg, tree = tree_sp, host_full = host_full, gdt = gdt,
+         comm = comm, meta = meta, n_groups = nrow(gdt),
+         n_species = uniqueN(gdt$species))
+  }
+
+  run_alpha <- function(x, idx, B) {
+    gdt <- x$gdt; trait_raw <- gdt[[idx]]
+    log10_trait <- idx == "Observed"; tree <- x$tree
+    obs_td <- agg_trait(gdt$species, trait_raw, gdt$n)
+    obs_lam <- lambda_fit(tree, obs_td, log10_trait)
+    sp_trait <- setNames(obs_td$trait, obs_td$label)[tree$tip.label]
+    sp_trait_l <- if (log10_trait) log10(sp_trait) else sp_trait
+    parallel::clusterExport(CL, c("gdt", "trait_raw", "tree", "sp_trait_l",
+                                  "log10_trait"), envir = environment())
+    parallel::clusterExport(CL, c("lambda_fit", "agg_trait"),
+                            envir = globalenv())
+    res <- list(); null_store <- list()
+    add <- function(mode, null) {
+      s <- summ_null(obs_lam, null)
+      s[, `:=`(region = x$reg, index = IDX_LAB[idx], mode = mode,
+               n_groups = x$n_groups, n_species = x$n_species,
+               n_perm_target = B)]
+      res[[length(res) + 1L]] <<- s
+      null_store[[mode]] <<- null
+    }
+    seed0 <- 20261106 + 1e6 * match(x$reg, REG3) + 1e5 * match(idx, INDICES)
+    seed_base <- seed0
+    parallel::clusterExport(CL, "seed_base", envir = environment())
+    null <- unlist(parallel::parLapplyLB(CL, seq_len(B), perm_before_global),
+                   use.names = FALSE)
+    add("before_global", null)
+    cat(sprintf("  [%s|%s] before_global done\n", x$reg, idx))
+    seed_base <- seed0 + 1e4
+    parallel::clusterExport(CL, "seed_base", envir = environment())
+    null <- unlist(parallel::parLapplyLB(CL, seq_len(B), perm_after_free),
+                   use.names = FALSE)
+    add("after_free", null)
+    cat(sprintf("  [%s|%s] after_free done\n", x$reg, idx))
+    list(tab = rbindlist(res, fill = TRUE), nulls = null_store)
+  }
+
+  run_beta <- function(x, B) {
+    gdt <- x$gdt; comm <- x$comm; host_full <- x$host_full
+    obs_r <- mantel_r(comm, host_full[gdt$species, gdt$species])
+    parallel::clusterExport(CL, c("gdt", "comm", "host_full"),
+                            envir = environment())
+    parallel::clusterExport(CL, "mantel_r", envir = globalenv())
+    seed_base <- 20261106 + 4e6 + 1e6 * match(x$reg, REG3)
+    parallel::clusterExport(CL, "seed_base", envir = environment())
+    null <- unlist(parallel::parLapplyLB(CL, seq_len(B), perm_beta_global),
+                   use.names = FALSE)
+    s <- summ_null(obs_r, null)
+    s[, `:=`(region = x$reg, mode = "global", n_groups = x$n_groups,
+             n_species = x$n_species, n_perm_target = B)]
+    cat(sprintf("  [%s|beta] global done\n", x$reg))
+    list(tab = s, nulls = list(global = null))
+  }
+
+  all_alpha <- list(); all_alpha_nulls <- list()
+  all_beta <- list(); all_beta_nulls <- list()
+  nulls_data <- list()
+  for (reg in REG3) {
+    x <- prep_region(reg)
+    cat(sprintf("[%s] samples=%d groups=%d species=%d\n", reg,
+                nrow(x$meta), x$n_groups, x$n_species))
+    for (idx in INDICES) {
+      ares <- run_alpha(x, idx, B_PERM)
+      all_alpha[[paste(reg, idx)]] <- ares$tab
+      all_alpha_nulls[[paste(reg, IDX_LAB[idx])]] <- ares$nulls
+    }
+    bres <- run_beta(x, B_PERM)
+    all_beta[[reg]] <- bres$tab
+    all_beta_nulls[[reg]] <- bres$nulls
+    nulls_data[[reg]] <- x
+  }
+  parallel::stopCluster(CL)
+
+  alpha_tab <- rbindlist(all_alpha, fill = TRUE)
+  beta_tab  <- rbindlist(all_beta, fill = TRUE)
+  saveRDS(list(alpha_tab = alpha_tab, beta_tab = beta_tab,
+               alpha_nulls = all_alpha_nulls, beta_nulls = all_beta_nulls,
+               nulls_data = nulls_data), PERM_CACHE)
+} else {
+  cat("loaded permutation cache:", PERM_CACHE, "\n")
+}
+
+PERM <- readRDS(PERM_CACHE)
+alpha_tab <- PERM$alpha_tab
+beta_tab  <- PERM$beta_tab
+
+star <- function(p) ifelse(is.na(p), "NA",
+                    ifelse(p <= 0.001, "***",
+                    ifelse(p <= 0.01, "**",
+                    ifelse(p <= 0.05, "*", "ns"))))
+alpha_tab[, `:=`(type = "alpha", sig = star(p_one_sided))]
+beta_tab[,  `:=`(type = "beta",  sig = star(p_one_sided))]
+alpha_out <- alpha_tab[, .(type, region, index, mode, observed, null_mean,
+                           null_q05, null_q95, p_one_sided, sig, n_valid,
+                           n_perm_target, n_groups, n_species)]
+beta_out <- beta_tab[, .(type, region, index = NA_character_, mode, observed,
+                         null_mean, null_q05, null_q95, p_one_sided, sig,
+                         n_valid, n_perm_target, n_groups, n_species)]
+perm_summary <- rbindlist(list(alpha_out, beta_out), fill = TRUE)
+write_tab(perm_summary, CHAPTER, "Tab_3_phylo_perm_summary")
+knitr::kable(perm_summary, digits = 3,
+             caption = "Host phylogenetic signal vs study x species permutation nulls (999 permutations; one-sided upper P)")
+```
+
+```{r fig-permutation}
+nulls <- list(alpha = PERM$alpha_nulls, beta = PERM$beta_nulls)
+alpha <- copy(alpha_tab)[mode %in% c("before_global", "after_free")]
+beta  <- copy(beta_tab)[mode == "global"]
+
+REG_LAB2 <- c(v4 = "V4", v5_v7 = "V5–V7", its1 = "ITS1")
+MODE_LAB <- c(before_global = "Stratified\nnull", after_free = "Free\nnull")
+alpha[, `:=`(region_lab = factor(REG_LAB2[region], levels = REG_LAB2),
+             mode_lab = factor(MODE_LAB[mode], levels = MODE_LAB),
+             index = factor(index, levels = c("Shannon", "Observed (log10)")),
+             sig = star(p_one_sided))]
+
+alpha_null <- rbindlist(lapply(names(nulls$alpha), function(k) {
+  parts <- strsplit(k, " ", fixed = TRUE)[[1]]
+  reg <- parts[1]; idx <- paste(parts[-1], collapse = " ")
+  rbindlist(lapply(names(nulls$alpha[[k]]), function(m) {
+    data.table(region = reg, index = idx, mode = m,
+               value = as.numeric(nulls$alpha[[k]][[m]]))
+  }))
+}))
+alpha_null[, `:=`(
+  region_lab = factor(REG_LAB2[region], levels = REG_LAB2),
+  mode_lab = factor(MODE_LAB[mode], levels = MODE_LAB),
+  index = factor(index, levels = c("Shannon", "Observed (log10)")))]
+
+beta[, `:=`(region_lab = factor(REG_LAB2[region], levels = REG_LAB2),
+            sig = star(p_one_sided))]
+beta_null <- rbindlist(lapply(names(nulls$beta), function(reg) {
+  data.table(region = reg, value = as.numeric(nulls$beta[[reg]][["global"]]))
+}))
+beta_null[, region_lab := factor(REG_LAB2[region], levels = REG_LAB2)]
+
+alpha_panel <- function(reg, show_y = FALSE, show_leg = FALSE) {
+  a  <- alpha[region == reg]
+  an <- alpha_null[region == reg]
+  p <- ggplot() +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey65") +
+    geom_jitter(data = an,
+                aes(x = mode_lab, y = value, colour = index, group = index),
+                position = position_jitterdodge(jitter.width = 0.16,
+                                                dodge.width = 0.65),
+                size = 0.8, alpha = 0.30, stroke = 0) +
+    geom_point(data = a,
+               aes(x = mode_lab, y = observed, colour = index, group = index),
+               position = position_jitterdodge(jitter.width = 0,
+                                               dodge.width = 0.65),
+               shape = 18, size = 4.0) +
+    geom_text(data = a,
+              aes(x = mode_lab, y = observed + 0.045, label = sig,
+                  group = index),
+              position = position_jitterdodge(jitter.width = 0,
+                                              dodge.width = 0.65),
+              size = 2.8, vjust = 0, colour = "grey20") +
+    scale_colour_manual(values = c("Shannon" = "#0072B2",
+                                   "Observed (log10)" = "#D55E00"),
+                        name = "Index") +
+    scale_x_discrete(drop = FALSE) +
+    scale_y_continuous(limits = c(0, 1.0), breaks = seq(0, 1, 0.25),
+                       expand = c(0, 0)) +
+    labs(x = NULL, y = "Pagel's lambda",
+         title = paste("Alpha:", REG_LAB2[reg])) +
+    theme_bw(base_size = 10.5) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major.x = element_blank(),
+          legend.position = if (show_leg) "bottom" else "none",
+          legend.direction = "horizontal",
+          legend.justification = "center",
+          plot.title = element_text(size = 10.5, face = "bold"))
+  if (!show_y) {
+    p <- p + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+                   axis.title.y = element_blank())
+  }
+  p
+}
+
+pA1 <- alpha_panel("v4", show_y = TRUE, show_leg = TRUE)
+pA2 <- alpha_panel("v5_v7", show_y = FALSE, show_leg = FALSE)
+pA3 <- alpha_panel("its1", show_y = FALSE, show_leg = FALSE)
+
+pB <- ggplot() +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey65") +
+  geom_jitter(data = beta_null, aes(x = region_lab, y = value),
+              width = 0.18, height = 0, size = 0.8, alpha = 0.30,
+              colour = "#0072B2", stroke = 0) +
+  geom_point(data = beta, aes(x = region_lab, y = observed),
+             shape = 18, size = 4.0, colour = "#D55E00") +
+  geom_text(data = beta, aes(x = region_lab, y = observed + 0.015, label = sig),
+            size = 2.8, vjust = 0, colour = "grey20") +
+  scale_y_continuous(limits = c(-0.15, 0.45), breaks = seq(-0.1, 0.4, 0.1),
+                     expand = c(0, 0)) +
+  labs(x = NULL, y = "Mantel r") +
+  theme_bw(base_size = 10.5) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank())
+
+# α (V4 / V5–V7 / ITS1) + β (group-level Mantel) in one 4-column figure;
+# no overall title/subtitle.
+p_alpha <- (pA1 | pA2 | pA3 | pB) +
+  plot_layout(widths = c(1, 1, 1, 1), guides = "collect") +
+  plot_annotation(theme = theme(legend.position = "bottom",
+                                legend.direction = "horizontal"))
+save_fig_ch3(p_alpha, "Fig_phylo_permutation_summary", 12.5, 4.2)
+embed_fig(CHAPTER, "Fig_phylo_permutation_summary")
+progress("permutation figure done")
+```
+
+# 5. Host phylogeny vs beta diversity (Mantel / MRM / dbRDA) / 宿主系统发育与 β 多样性
+
+Species-level mean Bray–Curtis distance vs host species cophenetic distance,
+with Mantel, MRM and dbRDA statistics; the heat of the figure is the pairwise
+distance scatter.
+
+```{r mantel-mrm}
+mantel_results <- list(); mantel_plots <- list()
+for (reg in REG3) {
+  bray_rds <- bray_path(reg)
+  pre_bray <- if (file.exists(bray_rds)) readRDS(bray_rds) else NULL
+  res <- mantel_mrm_analysis(dat[[reg]], bray_dist = pre_bray)
+  if (!is.null(res)) {
+    mantel_results[[reg]] <- res
+    mantel_plots[[reg]] <- res$plot_mantel
+  }
+}
+mantel_tab <- do.call(rbind, lapply(names(mantel_results), function(reg) {
+  r <- mantel_results[[reg]]
+  data.frame(Region = reg, Mantel_r = r$mantel_r, Mantel_P = r$mantel_p,
+             MRM_R2 = r$mrm_r2, MRM_R2_P = r$mrm_r2p,
+             MRM_F = r$mrm_F, MRM_F_P = r$mrm_Fp,
+             dbRDA_R2 = r$dbrda_r2, dbRDA_P = r$dbrda_p,
+             N_Species = r$n_species)
+}))
+write_tab(mantel_tab, CHAPTER, "Tab_3_mantel_mrm")
+knitr::kable(mantel_tab, digits = 4,
+             caption = "Mantel / MRM / dbRDA: host cophenetic distance vs species-mean microbial Bray-Curtis distance")
+
+p_mantel <- patchwork::wrap_plots(mantel_plots, ncol = length(mantel_plots)) +
+  patchwork::plot_annotation(
+    title = "Host Phylogenetic Distance vs Microbial Community Dissimilarity",
+    theme = ggplot2::theme(plot.title = ggplot2::element_text(
+      face = "bold", size = 14, hjust = 0.5)))
+save_fig_ch3(p_mantel, "mantel_mrm_combined", 5 * length(mantel_plots), 5)
+embed_fig(CHAPTER, "mantel_mrm_combined")
+progress("mantel_mrm_combined done")
+```
+
+# 6. Microbial phylogenetic signal of host distribution / 微生物系统发育与宿主分布
+
+The reverse question: do phylogenetically similar **microbes** have similar
+host-distribution features? Unit = mapped 97% SILVA reference bin (V4 / V5–V7,
+plus bins shared by both). Distribution distances (Jaccard on presence, Bray on
+within-sample relative abundance) are tested against the reference-tree
+patristic distance with Mantel / MRM, and compared with a source- and
+prevalence-stratified null (999 permutations).
+
+> Backend outputs are reused by default (`params$rebuild_asv = FALSE`); the
+> complete analysis code is kept below and can be re-run from the cache.
+
+## 6.1 Reference tree and mapped-bin cache / 参考树与 mapped-bin 缓存
+
+```{r asv-setup}
+ASV_ROOT  <- server_path("ch3", "asv_host_phylo")
+ASV_TAB   <- file.path(ASV_ROOT, "result_table/cross_region")
+ASV_PAPER <- file.path(ASV_ROOT, "paper_main")
+if (!REBUILD_ASV) {
+  need <- c(file.path(ASV_TAB, c(
+            "track1_16s_mantel.tsv", "track1_16s_mrm.tsv",
+            "track1_16s_close_far.tsv", "track2_16s_mantel.tsv",
+            "track2_16s_mrm.tsv", "track2_16s_close_far.tsv",
+            "track2_16s_sensitivity.tsv")),
+            file.path(ASV_PAPER, c("null_model_results.tsv", "null_draws.rds")))
+  if (!all(file.exists(need))) {
+    stop("mapped-bin ASV backend is incomplete under ", ASV_ROOT,
+         "; provide server_result/ch3/asv_host_phylo/ or set rebuild_asv=true",
+         call. = FALSE)
+  }
+}
+# The tree is copied from server_result during preprocessing.
+# 参考树在预处理阶段由 server_result 复制。
+ASV_TREE <- file.path(tree_dir(CHAPTER), "asv_ref_silva.nwk")
+if (!file.exists(ASV_TREE)) {
+  stop("asv_ref_silva.nwk missing; provide server_result/ch3/asv_ref_silva.nwk")
+}
+cat("reference tree tips:", length(ape::read.tree(ASV_TREE)$tip.label), "\n")
+```
+
+The reference tree is a pre-built SILVA 138.2 all-ASV tree (22,845 tips,
+identical to the mapped-bin row set); it is supplied under `server_result/ch3/`
+and rebuilt only with `params$rebuild_asv = TRUE`. The build recipe is in
+`scripts/server/asv_host_phylo/`.
+参考树由服务器预建，随 `server_result/ch3/` 提供；构建脚本见 `scripts/server/`。
+
+## 6.2 Analysis code (mapped bins, Mantel / MRM / null) / mapped-bin 分析
+
+```{r asv-analysis, eval=REBUILD_ASV}
+if (REBUILD_ASV) {
+  MAPPED_CFG <- list(`16S` = list(
+    table = "filtered_merge/16S/Merged_16S_table_filtered.txt",
+    ref   = "filtered_merge/16S/Merged_16S_Silva_filtered.fa",
+    tax   = "filtered_merge/16S/Merged_16S_taxonomy_filtered.txt",
+    meta  = "metadata/metadata_16S.txt",
+    tree  = ASV_TREE))
+  norm_id <- function(x) {
+    x <- gsub("-", ".", x, fixed = TRUE)
+    ifelse(grepl("^[0-9]", x), paste0("X", x), x)
+  }
+  read_fa_ids <- function(f) {
+    x <- readLines(f, warn = FALSE)
+    sub("^>([^ ]+).*$", "\\1", x[startsWith(x, ">")])
+  }
+  load_mapped_cache <- function(ds = "16S") {
+    cfg <- MAPPED_CFG[[ds]]
+    ids <- read_fa_ids(file.path(DATA_DIR, cfg$ref))
+    tab <- fread(file.path(DATA_DIR, cfg$table), sep = "\t",
+                 header = TRUE, check.names = FALSE)
+    setnames(tab, 1L, "ASV_ID")
+    tab <- tab[as.character(ASV_ID) %in% ids]
+    mat <- as.matrix(tab[, -1, with = FALSE])
+    rownames(mat) <- as.character(tab$ASV_ID)
+    rm(tab); invisible(gc())
+    sn <- norm_id(colnames(mat))
+    meta <- fread(file.path(DATA_DIR, cfg$meta), sep = "\t")
+    meta[, SampleID := norm_id(SampleID)]
+    meta <- meta[match(sn, meta$SampleID)]
+    meta[, species := as.character(species)]
+    meta[, source := as.character(source)]
+    meta[, Region := as.character(Region)]
+    list(mat = mat, meta = meta, ids = rownames(mat))
+  }
+  region_subset <- function(cache, region) {
+    cols <- which(cache$meta$Region == region)
+    list(mat = cache$mat[, cols, drop = FALSE], meta = cache$meta[cols])
+  }
+  breadth_stats <- function(mat, meta) {
+    sp <- meta$species; so <- meta$source
+    sp[!nzchar(sp)] <- NA_character_; so[!nzchar(so)] <- NA_character_
+    prev <- rowSums(mat > 0)
+    ct <- colSums(mat); ct <- ifelse(!is.finite(ct) | ct <= 0, 1, ct)
+    rel <- sweep(mat, 2L, ct, "/")
+    mean_rel <- rowMeans(rel)
+    nhost <- vapply(seq_len(nrow(mat)),
+                    function(i) uniqueN(sp[mat[i, ] > 0], na.rm = TRUE), integer(1))
+    nsrc <- vapply(seq_len(nrow(mat)),
+                   function(i) uniqueN(so[mat[i, ] > 0], na.rm = TRUE), integer(1))
+    list(prev = prev, mean_rel = mean_rel, nhost = nhost, nsrc = nsrc, rel = rel)
+  }
+  select_candidates <- function(mat, meta, prev_min = 20L, host_min = 5L,
+                                src_min = 3L) {
+    bs <- breadth_stats(mat, meta)
+    sp <- meta$species; sp[!nzchar(sp)] <- NA_character_
+    so <- meta$source;  so[!nzchar(so)] <- NA_character_
+    ht <- min(host_min, uniqueN(sp, na.rm = TRUE))
+    st <- min(src_min,  uniqueN(so, na.rm = TRUE))
+    keep <- bs$prev >= prev_min & bs$nhost >= ht & bs$nsrc >= st
+    list(mat = mat[keep, , drop = FALSE], meta = meta,
+         ids = rownames(mat)[keep])
+  }
+  dist_block <- function(mat, meta) {
+    ids <- rownames(mat)
+    bs <- breadth_stats(mat, meta)
+    dj <- vegdist(mat > 0, method = "jaccard", binary = TRUE)
+    db <- parallelDist::parDist(bs$rel, method = "bray", threads = 4)
+    if (is.null(attr(db, "Labels"))) attr(db, "Labels") <- ids
+    dpv <- as.dist(abs(outer(log10(bs$prev), log10(bs$prev), "-")))
+    dab <- as.dist(abs(outer(log10(bs$mean_rel + 1e-6),
+                             log10(bs$mean_rel + 1e-6), "-")))
+    dhost <- as.dist(abs(outer(bs$nhost, bs$nhost, "-")))
+    so <- meta$source; so[!nzchar(so)] <- NA_character_
+    if (uniqueN(so, na.rm = TRUE) >= 2L) {
+      src_pa <- (mat > 0) %*% model.matrix(~ 0 + factor(so))
+      dsrc <- vegdist(src_pa > 0, method = "jaccard", binary = TRUE)
+    } else {
+      dsrc <- as.dist(matrix(0, nrow(mat), nrow(mat),
+                             dimnames = list(ids, ids)))
+    }
+    list(dj = dj, db = db, prev = bs$prev, mean_rel = bs$mean_rel,
+         nhost = bs$nhost, nsrc = bs$nsrc, dpv = dpv, dab = dab,
+         dhost = dhost, dsrc = dsrc)
+  }
+  phylo_dist <- function(tree_file, ids) {
+    tr <- ape::read.tree(tree_file)
+    miss <- setdiff(ids, tr$tip.label)
+    if (length(miss)) stop("tree lacks ", length(miss), " ids")
+    if (length(tr$tip.label) != length(ids)) tr <- ape::keep.tip(tr, ids)
+    dpm <- cophenetic(tr)[ids, ids, drop = FALSE]
+    as.dist(dpm)
+  }
+  mantel_ecodist <- function(d, dp, nperm = 9999L) {
+    e <- ecodist::mantel(d ~ dp, nperm = nperm)
+    list(r = as.numeric(e["mantelr"]), p = as.numeric(e["pval1"]),
+         p_two = as.numeric(e["pval3"]),
+         CI_low = as.numeric(e["llim.2.5%"]),
+         CI_high = as.numeric(e["ulim.97.5%"]))
+  }
+  mrm_fit <- function(d, dp, dpv, dab, extra = NULL, nperm = 1999L) {
+    lt <- function(dd) { m <- as.matrix(dd); m[lower.tri(m)] }
+    base_v <- list(dp = lt(dp), dpv = lt(dpv), dab = lt(dab))
+    used <- character(0)
+    if (!is.null(extra)) for (nm in names(extra)) {
+      if (!inherits(extra[[nm]], "dist")) next
+      v <- lt(extra[[nm]])
+      if (sd(v) == 0) next
+      cors <- vapply(base_v, function(b) abs(cor(v, b, use = "complete.obs")),
+                     numeric(1))
+      if (any(!is.finite(cors)) || max(cors) > 0.995) next
+      used <- c(used, nm); base_v[[nm]] <- v
+    }
+    form <- as.formula(paste("d ~", paste(c("dp", "dpv", "dab", used),
+                                          collapse = " + ")))
+    m <- ecodist::MRM(form, nperm = nperm)
+    data.table(term = rownames(m$coef), coef = as.numeric(m$coef[, 1L]),
+               p = as.numeric(m$coef[, 2L]),
+               r_squared = as.numeric(m$r.squared[1L]),
+               r_squared_p = as.numeric(m$r.squared[2L]))
+  }
+  mantel_fast <- function(dx, dy, nperm = 999L, strata = NULL, seed = 20261111L) {
+    n <- attr(dx, "Size"); dm <- as.matrix(dx); ym <- as.matrix(dy)
+    lt <- lower.tri(dm); idx <- which(lt, arr.ind = TRUE)
+    i <- idx[, 1L]; j <- idx[, 2L]
+    x <- dm[lt]; y <- ym[lt]; obs <- cor(x, y)
+    if (!is.null(strata)) strata <- as.integer(factor(strata))
+    set.seed(seed); null <- numeric(nperm)
+    for (b in seq_len(nperm)) {
+      if (is.null(strata)) perm <- sample.int(n) else {
+        perm <- integer(n)
+        for (s in unique(strata)) {
+          ii <- which(strata == s); perm[ii] <- sample(ii)
+        }
+      }
+      null[b] <- cor(x, ym[cbind(perm[i], perm[j])])
+    }
+    p <- (1 + sum(null >= obs)) / (nperm + 1)
+    mu <- mean(null); sdv <- sd(null)
+    list(r = obs, p = p, p_greater = p, null_mean = mu, null_sd = sdv,
+         SES = if (is.finite(sdv) && sdv > 0) (obs - mu) / sdv else NA_real_,
+         null = null)
+  }
+  prevalence_strata <- function(prev, k = 5L) {
+    as.integer(cut(rank(prev, ties.method = "first"), breaks = k,
+                   labels = FALSE))
+  }
+  close_far_fast <- function(d, dp, strata = NULL, nperm = 999L,
+                             seed = 20261112L) {
+    dm <- as.matrix(d); pm <- as.matrix(dp); lt <- lower.tri(dm)
+    y <- dm[lt]; x <- pm[lt]
+    close <- x <= quantile(x, 0.10, na.rm = TRUE)
+    far   <- x >= quantile(x, 0.50, na.rm = TRUE)
+    obs <- mean(y[far]) - mean(y[close])
+    n <- nrow(dm); idx <- which(lt, arr.ind = TRUE)
+    ii <- idx[, 1L]; jj <- idx[, 2L]
+    if (!is.null(strata)) strata <- as.integer(factor(strata))
+    set.seed(seed); null <- numeric(nperm)
+    for (b in seq_len(nperm)) {
+      if (is.null(strata)) perm <- sample.int(n) else {
+        perm <- integer(n)
+        for (s in unique(strata)) {
+          ii_s <- which(strata == s); perm[ii_s] <- sample(ii_s)
+        }
+      }
+      yp <- dm[cbind(perm[ii], perm[jj])]
+      null[b] <- mean(yp[far]) - mean(yp[close])
+    }
+    list(contrast = obs, p = (1 + sum(null >= obs)) / (nperm + 1),
+         null_mean = mean(null), null_sd = sd(null))
+  }
+  dominant_source <- function(mat, meta) {
+    so <- meta$source; so[!nzchar(so)] <- NA_character_
+    counts <- (mat > 0) %*% model.matrix(~ 0 + factor(so))
+    dom <- colnames(counts)[max.col(counts, ties.method = "first")]
+    sub("factor(so)", "", dom, fixed = TRUE)
+  }
+
+  cache <- load_mapped_cache("16S")
+  NPERM_MAIN <- 9999L; NPERM_STRAT <- 999L; NPERM_MRM <- 1999L
+  NPERM_CF <- 999L; NPERM_SENS <- 999L
+  ALL_REGIONS <- c("V3_V4", "V4", "V5_V6", "V5_V7")
+
+  # ---- Track 1 (within-region) ----
+  mantel_rows <- list(); mrm_rows <- list(); cf_rows <- list()
+  for (ri in seq_along(ALL_REGIONS)) {
+    reg <- ALL_REGIONS[ri]
+    rs <- region_subset(cache, reg)
+    sel <- select_candidates(rs$mat, rs$meta)
+    if (length(sel$ids) < 10L) next
+    db <- dist_block(sel$mat, sel$meta)
+    dp <- phylo_dist(ASV_TREE, sel$ids)
+    strata <- prevalence_strata(db$prev, 5L)
+    for (mi in seq_along(c(J = "dj", B = "db"))) {
+      metric <- names(c(J = "dj", B = "db"))[mi]
+      d <- db[[c(J = "dj", B = "db")[mi]]]
+      m_std <- mantel_ecodist(d, dp, NPERM_MAIN)
+      m_ses <- mantel_fast(d, dp, nperm = 999L,
+                           seed = 20261141L + 100L * ri + mi)
+      m_str <- mantel_fast(d, dp, nperm = NPERM_STRAT, strata = strata,
+                           seed = 20261151L + 100L * ri + mi)
+      mantel_rows[[length(mantel_rows) + 1L]] <- data.table(
+        dataset = "16S", region = reg, metric = metric,
+        n_bins = length(sel$ids), n_pairs = m_ses$n_pairs,
+        r = m_std$r, p_standard = m_std$p, p_two_sided = m_std$p_two,
+        CI_low = m_std$CI_low, CI_high = m_std$CI_high,
+        null_mean = m_ses$null_mean, null_sd = m_ses$null_sd, SES = m_ses$SES,
+        p_stratified = m_str$p_greater, SES_stratified = m_str$SES)
+      m1 <- mrm_fit(d, dp, db$dpv, db$dab, nperm = NPERM_MRM)
+      m1[, `:=`(dataset = "16S", region = reg, metric = metric,
+                model = "primary")]
+      m2 <- mrm_fit(d, dp, db$dpv, db$dab,
+                    extra = list(dhost = db$dhost, dsrc = db$dsrc),
+                    nperm = NPERM_MRM)
+      m2[, `:=`(dataset = "16S", region = reg, metric = metric,
+                model = "extended")]
+      mrm_rows[[length(mrm_rows) + 1L]] <- rbind(m1, m2)
+      cf <- close_far_fast(d, dp, strata = strata, nperm = NPERM_CF,
+                           seed = 20261161L + 100L * ri + mi)
+      cf_rows[[length(cf_rows) + 1L]] <- data.table(
+        dataset = "16S", region = reg, metric = metric,
+        n_bins = length(sel$ids), contrast = cf$contrast, p = cf$p,
+        null_mean = cf$null_mean, null_sd = cf$null_sd)
+    }
+  }
+  track1_mantel <- rbindlist(mantel_rows, fill = TRUE)
+  track1_mrm <- rbindlist(mrm_rows, fill = TRUE)
+  track1_cf <- rbindlist(cf_rows, fill = TRUE)
+
+  # ---- Track 2 (V4 / V5-V7 shared bins) ----
+  A <- region_subset(cache, "V4"); B <- region_subset(cache, "V5_V7")
+  shared <- rowSums(A$mat > 0) > 0 & rowSums(B$mat > 0) > 0
+  matA0 <- A$mat[shared, , drop = FALSE]; matB0 <- B$mat[shared, , drop = FALSE]
+  matAB0 <- cbind(matA0, matB0); metaAB <- rbind(A$meta, B$meta)
+  bsAB <- breadth_stats(matAB0, metaAB)
+  prevA0 <- rowSums(matA0 > 0); prevB0 <- rowSums(matB0 > 0)
+  pass <- bsAB$prev >= 20 & bsAB$nhost >= 5 & bsAB$nsrc >= 3 &
+          prevA0 >= 5 & prevB0 >= 5
+  ids <- rownames(A$mat)[shared][pass]
+  matA <- matA0[pass, , drop = FALSE]; matB <- matB0[pass, , drop = FALSE]
+  dA <- dist_block(matA, A$meta); dB <- dist_block(matB, B$meta)
+  dp <- phylo_dist(ASV_TREE, ids)
+  prevA <- prevA0[pass]; prevB <- prevB0[pass]; names(prevA) <- names(prevB) <- ids
+  prev_total <- prevA + prevB; names(prev_total) <- ids
+  mean_rel_bal <- (dA$mean_rel + dB$mean_rel) / 2; names(mean_rel_bal) <- ids
+  imbalance <- abs(log10(prevA) - log10(prevB))
+  dpv <- as.dist(abs(outer(log10(prev_total), log10(prev_total), "-")))
+  dab <- as.dist(abs(outer(log10(mean_rel_bal + 1e-6),
+                           log10(mean_rel_bal + 1e-6), "-")))
+  dprev <- as.dist(abs(outer(imbalance, imbalance, "-")))
+  bsAB_p <- breadth_stats(matAB0[pass, , drop = FALSE], metaAB)
+  dhost <- as.dist(abs(outer(bsAB_p$nhost, bsAB_p$nhost, "-")))
+  dsrc <- dist_block(matAB0[pass, , drop = FALSE], metaAB)$dsrc
+  strata <- prevalence_strata(prev_total, 5L)
+  t2_mantel <- list(); t2_mrm <- list(); t2_cf <- list(); t2_sens <- list()
+  for (metric in c("J", "B")) {
+    ma <- as.matrix(dA[[c(J = "dj", B = "db")[metric]]])
+    mb <- as.matrix(dB[[c(J = "dj", B = "db")[metric]]])
+    d <- as.dist((ma + mb) / 2); attr(d, "Labels") <- ids
+    ms <- mantel_ecodist(d, dp, NPERM_MAIN)
+    t2_mantel[[metric]] <- data.table(
+      dataset = "16S", region_a = "V4", region_b = "V5_V7", metric = metric,
+      n_bins = length(ids), r = ms$r, p_standard = ms$p, CI_low = ms$CI_low,
+      CI_high = ms$CI_high, p_stratified = mantel_fast(
+        d, dp, nperm = NPERM_STRAT, strata = strata, seed = 20261211L)$p_greater)
+    m1 <- mrm_fit(d, dp, dpv, dab, extra = list(dprev = dprev),
+                  nperm = NPERM_MRM)
+    m1[, `:=`(dataset = "16S", region_a = "V4", region_b = "V5_V7",
+              metric = metric, model = "primary")]
+    m2 <- mrm_fit(d, dp, dpv, dab,
+                  extra = list(dprev = dprev, dhost = dhost, dsrc = dsrc),
+                  nperm = NPERM_MRM)
+    m2[, `:=`(dataset = "16S", region_a = "V4", region_b = "V5_V7",
+              metric = metric, model = "extended")]
+    t2_mrm[[metric]] <- rbind(m1, m2)
+    cf <- close_far_fast(d, dp, strata = strata, nperm = NPERM_CF,
+                         seed = 20261221L)
+    t2_cf[[metric]] <- data.table(
+      dataset = "16S", region_a = "V4", region_b = "V5_V7", metric = metric,
+      n_bins = length(ids), contrast = cf$contrast, p = cf$p,
+      null_mean = cf$null_mean, null_sd = cf$null_sd)
+    for (agg in c("min", "max")) {
+      mm <- if (agg == "min") pmin(ma, mb) else pmax(ma, mb)
+      dd <- as.dist(mm); attr(dd, "Labels") <- ids
+      sg <- mantel_ecodist(dd, dp, NPERM_SENS)
+      t2_sens[[paste(metric, agg)]] <- data.table(
+        dataset = "16S", region_a = "V4", region_b = "V5_V7", metric = metric,
+        analysis = paste0("pair_", agg), n_bins = length(ids),
+        r = sg$r, p = sg$p)
+    }
+  }
+  # sensitivity: within-region prevalence >= 10
+  pass10 <- pass & prevA0 >= 10L & prevB0 >= 10L
+  if (sum(pass10) >= 20L) {
+    ids10 <- rownames(A$mat)[shared][pass10]
+    dA10 <- dist_block(matA0[pass10, , drop = FALSE], A$meta)
+    dB10 <- dist_block(matB0[pass10, , drop = FALSE], B$meta)
+    dp10 <- phylo_dist(ASV_TREE, ids10)
+    for (metric in c("J", "B")) {
+      ma <- as.matrix(dA10[[c(J = "dj", B = "db")[metric]]])
+      mb <- as.matrix(dB10[[c(J = "dj", B = "db")[metric]]])
+      dd <- as.dist((ma + mb) / 2); attr(dd, "Labels") <- ids10
+      sg <- mantel_ecodist(dd, dp10, NPERM_SENS)
+      t2_sens[[paste(metric, "w10")]] <- data.table(
+        dataset = "16S", region_a = "V4", region_b = "V5_V7", metric = metric,
+        analysis = "within_min10", n_bins = length(ids10),
+        r = sg$r, p = sg$p)
+    }
+  }
+  track2_mantel <- rbindlist(t2_mantel)
+  track2_mrm <- rbindlist(t2_mrm)
+  track2_cf <- rbindlist(t2_cf)
+  track2_sens <- rbindlist(t2_sens)
+
+  # ---- source-stratified null (999 permutations) ----
+  null_rows <- list(); draw_rows <- list()
+  units <- list(
+    list(unit = "V4 (within)", mode = "within", reg = "V4"),
+    list(unit = "V5-V7 (within)", mode = "within", reg = "V5_V7"),
+    list(unit = "V4-V5-V7 (shared)", mode = "cross", reg = NA_character_))
+  for (ui in seq_along(units)) {
+    u <- units[[ui]]
+    if (u$mode == "within") {
+      rs <- region_subset(cache, u$reg)
+      sel <- select_candidates(rs$mat, rs$meta)
+      db <- dist_block(sel$mat, sel$meta)
+      dom <- dominant_source(sel$mat, rs$meta)
+      strata <- interaction(dom, prevalence_strata(db$prev, 5))
+      dlist <- list(J = db$dj, B = db$db); dp <- phylo_dist(ASV_TREE, sel$ids)
+      n_bins <- length(sel$ids)
+    } else {
+      dom <- dominant_source(matAB0[pass, , drop = FALSE], metaAB)
+      strata <- interaction(dom, prevalence_strata(prev_total, 5))
+      paired <- function(x, y) as.dist((as.matrix(x) + as.matrix(y)) / 2)
+      dJ <- paired(dA$dj, dB$dj); dB_ <- paired(dA$db, dB$db)
+      attr(dJ, "Labels") <- ids; attr(dB_, "Labels") <- ids
+      dlist <- list(J = dJ, B = dB_); dp <- phylo_dist(ASV_TREE, ids)
+      n_bins <- length(ids)
+    }
+    tbl <- table(strata); n_permutable <- sum(tbl[tbl >= 2])
+    for (mi in 1:2) {
+      met <- c(J = "J", B = "B")[mi]
+      m <- mantel_fast(dlist[[met]], dp, nperm = 999L, strata = strata,
+                       seed = 20261231L + 100L * ui + mi)
+      null_rows[[length(null_rows) + 1L]] <- data.table(
+        unit = u$unit, metric = met, n_bins = n_bins,
+        strata_n = length(tbl), strata_ge2 = sum(tbl >= 2),
+        n_permutable = n_permutable, observed_r = m$r,
+        null_mean = m$null_mean, null_sd = m$null_sd,
+        null_q05 = as.numeric(quantile(m$null, 0.05, na.rm = TRUE)),
+        null_q95 = as.numeric(quantile(m$null, 0.95, na.rm = TRUE)),
+        null_min = min(m$null, na.rm = TRUE),
+        null_max = max(m$null, na.rm = TRUE),
+        p_source_stratified = m$p_greater, SES = m$SES, n_perm = 999L)
+      draw_rows[[length(draw_rows) + 1L]] <- data.table(
+        unit = u$unit, metric = met, draw = seq_along(m$null), r = m$null)
+    }
+  }
+  null_res <- rbindlist(null_rows); null_draws <- rbindlist(draw_rows)
+
+  dir.create(file.path(int_dir(CHAPTER), "asv_beta_phylo"),
+             recursive = TRUE, showWarnings = FALSE)
+  saveRDS(list(track1_mantel = track1_mantel, track1_mrm = track1_mrm,
+               track1_cf = track1_cf, track2_mantel = track2_mantel,
+               track2_mrm = track2_mrm, track2_cf = track2_cf,
+               track2_sens = track2_sens,
+               null_res = null_res, null_draws = null_draws),
+          file.path(rds_dir(CHAPTER), "asv_beta_phylo.rds"))
+}
+```
+
+## 6.3 Main table and figure / 主表与主图
+
+```{r asv-figure}
+# Read the archived server outputs, or the freshly rebuilt cache.
+# 读取服务器存档结果或本地重建缓存。
+asv_cache <- file.path(rds_dir(CHAPTER), "asv_beta_phylo.rds")
+if (file.exists(asv_cache)) {
+  A2 <- readRDS(asv_cache)
+  t1m <- A2$track1_mantel; t1c <- A2$track1_cf
+  t2m <- A2$track2_mantel; t2c <- A2$track2_cf; t2s <- A2$track2_sens
+  null_res <- A2$null_res; null_draws <- A2$null_draws
+  t1r <- A2$track1_mrm[A2$track1_mrm$term == "dp" &
+                       A2$track1_mrm$model == "primary"]
+  t2r <- A2$track2_mrm[A2$track2_mrm$term == "dp" &
+                       A2$track2_mrm$model == "primary"]
+} else {
+  t1m <- fread(file.path(ASV_TAB, "track1_16s_mantel.tsv"))
+  t1r <- fread(file.path(ASV_TAB, "track1_16s_mrm.tsv"))
+  t1c <- fread(file.path(ASV_TAB, "track1_16s_close_far.tsv"))
+  t2m <- fread(file.path(ASV_TAB, "track2_16s_mantel.tsv"))
+  t2r <- fread(file.path(ASV_TAB, "track2_16s_mrm.tsv"))
+  t2c <- fread(file.path(ASV_TAB, "track2_16s_close_far.tsv"))
+  t2s <- fread(file.path(ASV_TAB, "track2_16s_sensitivity.tsv"))
+  null_res <- fread(file.path(ASV_PAPER, "null_model_results.tsv"))
+  null_draws <- readRDS(file.path(ASV_PAPER, "null_draws.rds"))
+  t1r <- t1r[term == "dp" & model == "primary"]
+  t2r <- t2r[region_a == "V4" & region_b == "V5_V7" &
+             term == "dp" & model == "primary"]
+}
+
+t1m <- t1m[region %in% c("V4", "V5_V7")]
+t1c <- t1c[region %in% c("V4", "V5_V7")]
+t2m <- t2m[region_a == "V4" & region_b == "V5_V7"]
+t2c <- t2c[region_a == "V4" & region_b == "V5_V7"]
+t2s <- t2s[region_a == "V4" & region_b == "V5_V7"]
+
+unit_levels <- c("V4 (within)", "V5-V7 (within)", "V4-V5-V7 (shared)")
+unit_lab <- c(V4 = "V4 (within)", V5_V7 = "V5-V7 (within)")
+
+eff1 <- t1m[, .(unit = unit_lab[region], n_bins = n_bins, metric = metric,
+                r = r, CI_low = CI_low, CI_high = CI_high,
+                p = p_standard, p_strat = p_stratified)]
+eff2 <- t2m[, .(unit = "V4-V5-V7 (shared)", n_bins = n_bins, metric = metric,
+                r = r, CI_low = CI_low, CI_high = CI_high,
+                p = p_standard, p_strat = p_stratified)]
+eff <- rbind(eff1, eff2)
+eff[, unit := factor(unit, levels = unit_levels)]
+eff[, metric := factor(metric, levels = c("J", "B"))]
+
+short1 <- t1c[, .(unit = unit_lab[region], metric = metric,
+                  contrast = contrast, p = p, SES = SES)]
+short2 <- t2c[, .(unit = "V4-V5-V7 (shared)", metric = metric,
+                  contrast = contrast, p = p, SES = SES)]
+short <- rbind(short1, short2)
+short[, unit := factor(unit, levels = unit_levels)]
+short[, metric := factor(metric, levels = c("J", "B"))]
+
+prim <- t2m[, .(scenario = "primary", metric = metric, r = r,
+                p = p_standard, n_bins = n_bins)]
+sens <- t2s[, .(scenario = analysis, metric = metric, r = r, p = p,
+                n_bins = n_bins)]
+sens <- rbind(prim, sens)
+sens[, scenario := factor(
+  scenario, levels = c("primary", "within_min10", "pair_min", "pair_max"),
+  labels = c("Primary", "Within-region n >= 10", "Pair min", "Pair max"))]
+sens[, metric := factor(metric, levels = c("J", "B"))]
+null_res[, unit := factor(unit, levels = unit_levels)]
+null_res[, metric := factor(metric, levels = c("J", "B"))]
+null_draws[, unit := factor(unit, levels = unit_levels)]
+null_draws[, metric := factor(metric, levels = c("J", "B"))]
+
+star_sig <- function(p) ifelse(
+  is.na(p), "",
+  ifelse(p <= 0.001, "***",
+         ifelse(p <= 0.01, "**",
+                ifelse(p <= 0.05, "*", "ns"))))
+null_res[, sig := star_sig(p_source_stratified)]
+
+pA <- ggplot() +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey55") +
+  geom_jitter(data = null_draws,
+              aes(x = unit, y = r, colour = metric),
+              position = position_jitterdodge(jitter.width = 0.16,
+                                              dodge.width = 0.60),
+              size = 0.5, alpha = 0.25, stroke = 0) +
+  geom_pointrange(data = eff,
+                  aes(x = unit, y = r, ymin = CI_low, ymax = CI_high,
+                      colour = metric),
+                  position = position_dodge(width = 0.60),
+                  linewidth = 0.45, size = 0.25) +
+  geom_point(data = eff, aes(x = unit, y = r, colour = metric),
+             position = position_dodge(width = 0.60), shape = 18, size = 3.8) +
+  geom_text(data = null_res,
+            aes(x = unit, y = observed_r + 0.014, label = sig, colour = metric),
+            position = position_dodge(width = 0.60), size = 3.0, vjust = 0,
+            show.legend = FALSE) +
+  scale_colour_manual(values = c(J = "#2C6E9B", B = "#D17B2F"),
+                      labels = c(J = "Jaccard", B = "Bray-Curtis")) +
+  scale_x_discrete(labels = c("V4 (within)" = "V4\n(within)",
+                              "V5-V7 (within)" = "V5-V7\n(within)",
+                              "V4-V5-V7 (shared)" = "V4-V5-V7\n(shared)")) +
+  scale_y_continuous(limits = c(-0.02, 0.235), breaks = seq(0, 0.2, by = 0.05)) +
+  labs(x = NULL, y = "Mantel r", colour = NULL) +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank())
+
+pB <- ggplot(short, aes(x = contrast, y = unit, colour = metric)) +
+  geom_vline(xintercept = 0, linetype = 2, colour = "grey55") +
+  geom_point(size = 2.6, position = position_dodge(width = 0.35)) +
+  scale_colour_manual(values = c(J = "#2C6E9B", B = "#D17B2F"),
+                      labels = c(J = "Jaccard", B = "Bray-Curtis")) +
+  scale_x_continuous(limits = c(0, 0.06), breaks = seq(0, 0.05, by = 0.01)) +
+  labs(x = "Far 50% - closest 10% mean distance", y = NULL, colour = NULL) +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank())
+
+pC <- ggplot(sens, aes(x = r, y = scenario, colour = metric)) +
+  geom_vline(xintercept = 0, linetype = 2, colour = "grey55") +
+  geom_point(size = 2.6, position = position_dodge(width = 0.35)) +
+  scale_colour_manual(values = c(J = "#2C6E9B", B = "#D17B2F"),
+                      labels = c(J = "Jaccard", B = "Bray-Curtis")) +
+  scale_x_continuous(limits = c(0, 0.17), breaks = seq(0, 0.15, by = 0.05)) +
+  labs(x = "Mantel r", y = NULL, colour = NULL) +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank())
+
+fig_asv <- (pA | pB) / pC + plot_layout(heights = c(1, 0.9))
+save_fig_ch3(fig_asv, "Fig_ASV_beta_phylo", 10, 7.5)
+embed_fig(CHAPTER, "Fig_ASV_beta_phylo")
+
+# ---- source data ----
+src <- rbind(
+  eff[, .(panel = "A", unit = as.character(unit), metric = as.character(metric),
+          value = r, low = CI_low, high = CI_high, p = p, n = n_bins,
+          scenario = NA_character_)],
+  short[, .(panel = "B", unit = as.character(unit), metric = as.character(metric),
+            value = contrast, low = NA_real_, high = NA_real_, p = p,
+            n = NA_integer_, scenario = NA_character_)],
+  sens[, .(panel = "C", unit = "V4-V5-V7 (shared)",
+           metric = as.character(metric), value = r, low = NA_real_,
+           high = NA_real_, p = p, n = n_bins,
+           scenario = as.character(scenario))])
+write_int(src, CHAPTER, "Fig_ASV_beta_phylo_source_data")
+
+# ---- main table ----
+fmt_p <- function(x) ifelse(is.na(x), NA_character_,
+                            ifelse(x < 0.001, "<0.001",
+                                   formatC(x, format = "f", digits = 3)))
+fmt_r <- function(r, lo, hi) sprintf("%.3f (%.3f-%.3f)", r, lo, hi)
+fmt_far <- function(x, p) sprintf("%.3f (%s)", x, fmt_p(p))
+
+tab_long <- merge(
+  eff[unit != "V4-V5-V7 (shared)",
+      .(unit, n_bins, metric, r, CI_low, CI_high, p_mantel = p, p_strat)],
+  t1r[, .(unit = unit_lab[region], metric = metric,
+          p_mrm = p, r2_mrm = r_squared)],
+  by = c("unit", "metric"), all.x = TRUE)
+t2r_rows <- t2r[, .(unit = "V4-V5-V7 (shared)", metric = metric,
+                    p_mrm = p, r2_mrm = r_squared)]
+tab_long <- rbind(tab_long,
+                  merge(eff[unit == "V4-V5-V7 (shared)"], t2r_rows,
+                        by = c("unit", "metric"), all.x = TRUE),
+                  fill = TRUE)
+tab_long <- merge(tab_long,
+                  short[, .(unit, metric, contrast, p_short = p)],
+                  by = c("unit", "metric"), all.x = TRUE)
+tab_long <- merge(tab_long,
+                  null_res[, .(unit, metric, p_null = p_source_stratified,
+                               null_mean, null_q05, null_q95)],
+                  by = c("unit", "metric"), all.x = TRUE)
+tab_long[, unit := factor(unit, levels = unit_levels)]
+tab_long[, metric := factor(metric, levels = c("J", "B"))]
+setorder(tab_long, unit, metric)
+
+make_row <- function(u) {
+  j <- tab_long[unit == u & metric == "J"]
+  b <- tab_long[unit == u & metric == "B"]
+  data.table(
+    Analysis = as.character(u),
+    `n bins` = j$n_bins,
+    `Jaccard r (95% CI)` = fmt_r(j$r, j$CI_low, j$CI_high),
+    `Jaccard MRM P (R2)` = sprintf("%s (%.3f)", fmt_p(j$p_mrm), j$r2_mrm),
+    `Jaccard null P` = fmt_p(j$p_null),
+    `Jaccard far-close (P)` = fmt_far(j$contrast, j$p_short),
+    `Bray-Curtis r (95% CI)` = fmt_r(b$r, b$CI_low, b$CI_high),
+    `Bray-Curtis MRM P (R2)` = sprintf("%s (%.3f)", fmt_p(b$p_mrm), b$r2_mrm),
+    `Bray-Curtis null P` = fmt_p(b$p_null),
+    `Bray-Curtis far-close (P)` = fmt_far(b$contrast, b$p_short))
+}
+asv_tab <- rbindlist(lapply(unit_levels, make_row))
+write_tab(asv_tab, CHAPTER, "Tab_3_asv_beta_phylo")
+knitr::kable(asv_tab, caption = "Phylogenetic signal in host-distribution features of mapped 16S reference bins")
+
+# ---- provenance of the source-stratified null ----
+data.table::fwrite(null_res, file.path(ch_dir(CHAPTER, "tables"),
+                                       "ASV_beta_phylo_null_model.tsv"),
+                   sep = "\t")
+data.table::fwrite(null_draws, file.path(ch_dir(CHAPTER, "tables"),
+                                         "ASV_beta_phylo_null_draws.tsv"),
+                   sep = "\t")
+saveRDS(null_draws, file.path(rds_dir(CHAPTER), "asv_beta_phylo_null_draws.rds"))
+```
+
+```{r log}
+write_log(CHAPTER, "ch3_summary", c(
+  sprintf("regions: %s", paste(REG3, collapse = ", ")),
+  sprintf("phylosig rows: %d", nrow(phylosig_tab)),
+  sprintf("lambda CI rows: %d", nrow(lam_tab)),
+  sprintf("permutation: alpha %d rows; beta %d rows",
+          nrow(alpha_tab), nrow(beta_tab)),
+  sprintf("mantel: %s", paste(capture.output(print(mantel_tab)), collapse = " | ")),
+  sprintf("asv backend: %s",
+          if (file.exists(asv_cache)) "rebuilt in chapter cache" else "reused result/ASV_host_phylo"),
+  "alpha permutations: 999 (stratified/free); lambda bootstrap: 500; ASV null: 999"
+))
+cat("Chapter 3 finished\n")
+```

@@ -1,0 +1,136 @@
+---
+title: "Preprocessing - CSS tables, host trees and server assets"
+output:
+  html_document:
+    toc: false
+    self_contained: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE,
+                      fig.show = "hide", comment = "#>")
+source(file.path(normalizePath(getwd(), winslash = "/"), "R", "config.R"))
+source(file.path(PROJECT_ROOT, "R", "common.R"))
+source(file.path(PROJECT_ROOT, "R", "preprocess.R"))
+ensure_v2_dirs()
+```
+
+# Preprocessing / 预处理
+
+本步骤把输入整理为后续五章直接读取的形式：解析 CSS 表、准备宿主树、
+准备 alpha/β 缓存，并把只读服务器结果复制到 `result/`。
+This step resolves CSS tables, host trees, alpha/beta caches and copies the
+read-only server results into the result layout used by Chapters 1–5.
+
+## 1. Inputs / 输入检查
+
+```{r inputs}
+required <- c(
+  file.path(DATA_DIR, "metadata", "metadata_16S.txt"),
+  file.path(DATA_DIR, "metadata", "metadata_ITS.txt"),
+  file.path(DATA_DIR, "filtered_merge", "16S", "Merged_16S_table_filtered.txt"),
+  file.path(DATA_DIR, "filtered_merge", "ITS", "Merged_ITS_table_filtered.txt"),
+  file.path(DATA_DIR, "filtered_merge", "16S", "Merged_16S_taxonomy_filtered.txt"),
+  file.path(DATA_DIR, "filtered_merge", "ITS", "Merged_ITS_taxonomy_filtered.txt"),
+  file.path(DATA_DIR, "plant_tree", "species_all.nwk")
+)
+missing <- required[!file.exists(required)]
+stopifnot(!length(missing))
+cat(sprintf("inputs: %d required files present\n", length(required)))
+```
+
+## 2. CSS tables / CSS 表
+
+随仓库提供的 `data/standard_*` 默认直接使用；缺失或设置
+`SEED_RECOMPUTE=css` 时从 `filtered_*` 重算到 `result/prepared/`。
+Shipped CSS tables are used by default; missing tables (or
+`SEED_RECOMPUTE=css`) are regenerated from the filtered counts.
+
+```{r css}
+ensure_css(force = want_recompute("css"))
+for (ds in c("16s", "its")) {
+  f <- css_merged_path(paste0("css_", ds, "_asvtab.txt"))
+  cat(sprintf("merged %s: %s (%.1f MB)\n", ds, f, file.size(f) / 1e6))
+}
+for (reg in c("its1", "its2", "v3_v4", "v4", "v5_v6", "v5_v7")) {
+  f <- css_region_path(reg, paste0("css_", reg, "_asvtab.txt"))
+  stopifnot(file.exists(f))
+}
+cat("six region CSS tables resolved\n")
+```
+
+## 3. Host trees / 宿主树
+
+区段树与属级树由 TimeTree 导出树和 metadata 派生；随仓库提供的派生树
+存在时直接复用。Region and genus trees are derived from the TimeTree export
+and metadata; shipped derived trees are reused when available.
+
+```{r host-trees}
+ensure_host_trees()
+for (f in c("plant_species_tree_all.nwk", "plant_species_tree_v4.nwk",
+            "plant_species_tree_v5_v7.nwk", "plant_species_tree_its1.nwk",
+            "plant_Genus_tree_all.nwk")) {
+  tr <- ape::read.tree(host_tree_path(f))
+  cat(sprintf("%-28s %5d tips\n", f, length(tr$tip.label)))
+}
+```
+
+## 4. Alpha and beta caches / α、β 缓存
+
+三个稿件区段的 alpha 多样性与 Bray-Curtis 距离默认读取随仓库缓存；
+缺失或 `SEED_RECOMPUTE=alphabeta` 时从区段 CSS 表重算。
+Alpha diversity and Bray-Curtis distances for the three manuscript regions
+are read from the shipped cache; missing caches are recomputed from CSS.
+
+```{r alpha-beta}
+ensure_alpha_beta(force = want_recompute("alphabeta"))
+for (reg in c("v4", "v5_v7", "its1")) {
+  a <- readRDS(precomp_path(paste0("alpha_div_", reg, ".rds"), "alphabeta"))
+  b <- readRDS(bray_path(reg))
+  stopifnot(nrow(a) == attr(b, "Size"))
+  cat(sprintf("%-6s alpha %5d samples; Bray %5d x %5d\n",
+              reg, nrow(a), attr(b, "Size"), attr(b, "Size")))
+}
+```
+
+## 5. Server results / 服务器结果
+
+服务器结果只读，复制到各章读取的位置；文件缺失时停止并提示补交结果或
+运行 `scripts/server/` 中的脚本。Server results are read-only and copied
+into the result layout; missing files stop the run with a pointer to the
+documented server scripts.
+
+```{r server-assets}
+materialize_server_assets(strict = TRUE)
+srv <- c(
+  "ch1/host_overview_tree.pdf",
+  "ch2/mixed_pool_adonis.rds",
+  "ch2/adonis/partA_units.rds",
+  "ch2/adonis/partB_pools.rds",
+  "ch2/beta/bray_dist_v4.rds",
+  "ch2/beta/bray_dist_v5_v7.rds",
+  "ch2/beta/bray_dist_its1.rds",
+  "ch3/asv_ref_silva.nwk",
+  "ch3/boot_lambda_samples.rds",
+  "ch4/gos_hostn_pos_16s_midpoint.nwk",
+  "ch4/Tab_4_tree_phylosig.tsv",
+  "ch4/Tab_4_tree_generalist_D.tsv"
+)
+stopifnot(all(file.exists(server_path(srv))))
+cat(sprintf("server assets: %d required files present\n", length(srv)))
+```
+
+## 6. Run log / 运行记录
+
+```{r log}
+writeLines(c(
+  paste("Preprocessing:", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
+  paste("PROJECT_ROOT:", PROJECT_ROOT),
+  paste("R:", R.version.string),
+  paste("SEED_RECOMPUTE:", paste(RECOMPUTE_STEPS, collapse = ",")),
+  paste("SEED_ALLOW_SERVER_RECOMPUTE:", ALLOW_SERVER_RECOMPUTE),
+  paste("CSS rebuilt:", want_recompute("css")),
+  paste("alpha/beta rebuilt:", want_recompute("alphabeta"))
+), file.path(RESULT_DIR, "logs", "preprocessing.log"))
+cat("preprocessing complete\n")
+```

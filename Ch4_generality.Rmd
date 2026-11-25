@@ -1,0 +1,1858 @@
+---
+title: "Chapter 4 - Generalists and specialists of the seed microbiome"
+output:
+  html_document:
+    toc: false
+    self_contained: false
+params:
+  force_recompute: false
+  rerun_loo: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = TRUE, warning = TRUE,
+  fig.show = "hide", comment = "#>"
+)
+source(file.path(normalizePath(getwd(), winslash = "/"), "R", "config.R"))
+source(file.path(PROJECT_ROOT, "R", "common.R"))
+suppressMessages({
+  library(data.table)
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(ape)
+  library(Matrix)
+  library(patchwork)
+  library(grid)
+  library(ggrepel)
+  library(scales)
+})
+ensure_v2_dirs()
+CHAPTER <- "ch4_generality"
+FORCE <- isTRUE(params$force_recompute)
+RERUN_LOO <- isTRUE(params$rerun_loo)
+progress <- make_progress(CHAPTER)
+```
+
+# 1. Data / 数据
+
+The analysis unit is the **host genus** (`metadata$Genus`), not the host species of
+Chapter 3. Three site tables are used: the merged CSS table (all samples of a
+kingdom), the cleaned metadata, and the reference-mapped ASV universe
+(`Merged_*_*_filtered.fa`, 23,021 16S and 5,072 ITS ASVs). Presence is defined as
+CSS abundance > 0.
+
+```{r data}
+TAX_FILE <- c(
+  `16S` = "filtered_merge/16S/Merged_16S_taxonomy_filtered.txt",
+  ITS   = "filtered_merge/ITS/Merged_ITS_taxonomy_filtered.txt"
+)
+CSS_FILE <- c(`16S` = "css_16s_asvtab.txt", ITS = "css_its_asvtab.txt")
+REF_FILE <- c(
+  `16S` = "filtered_merge/16S/Merged_16S_Silva_filtered.fa",
+  ITS   = "filtered_merge/ITS/Merged_ITS_Unite_filtered.fa"
+)
+
+md_all <- read_all_meta()
+md_all[, Genus := trimws(as.character(Genus))]
+tax_all <- lapply(TAX_FILE, function(f) {
+  data.table::fread(file.path(DATA_DIR, f), sep = "\t")
+})
+names(tax_all) <- names(TAX_FILE)
+
+ref_ids <- lapply(REF_FILE, function(f) {
+  lines <- readLines(file.path(DATA_DIR, f), warn = FALSE)
+  sub(" .*$", "", sub("^>", "", lines[grepl("^>", lines)]))
+})
+
+# Build the mapped presence matrix from the merged CSS table.  The result is
+# cached because the 16S CSS table is ~425 MB; a cached copy is read on reruns.
+build_presence <- function(ds, verbose = TRUE) {
+  raw <- data.table::fread(css_merged_path(CSS_FILE[[ds]]),
+                           sep = "\t", header = TRUE, showProgress = FALSE)
+  asv <- as.character(raw[[1L]])
+  sample_cols <- names(raw)[-1L]
+  met <- md_all[dataset == ds]
+  idx <- match(sample_cols, met$SampleID)
+  if (anyNA(idx)) {
+    idx2 <- match(sub("^X", "", sample_cols), met$SampleID)
+    idx[is.na(idx)] <- idx2[is.na(idx)]
+  }
+  keep_s <- !is.na(idx)
+  if (any(!keep_s)) {
+    warning(sprintf("%s: %d samples not found in metadata; dropped",
+                    ds, sum(!keep_s)))
+    sample_cols <- sample_cols[keep_s]
+    idx <- idx[keep_s]
+  }
+  keep_asv <- asv %in% ref_ids[[ds]]
+  if (verbose) {
+    cat(sprintf("%s: CSS %d ASV x %d samples; mapped ASV %d\n",
+                ds, nrow(raw), ncol(raw), sum(keep_asv)))
+  }
+  m <- as.matrix(raw[keep_asv, which(keep_s) + 1L, with = FALSE])
+  asv_m <- asv[keep_asv]
+  rm(raw); invisible(gc())
+  pres <- m > 0
+  dimnames(pres) <- list(asv_m, sample_cols)
+  mean_css <- rowMeans(m)
+  rm(m); invisible(gc())
+  met <- as.data.frame(met[idx])
+  stopifnot(identical(met$SampleID, sample_cols))
+  list(ds = ds, asv = asv_m, samples = sample_cols, presence = pres,
+       mean_css = mean_css, meta = met)
+}
+
+load_presence <- function(ds, force = FALSE) {
+  f <- file.path(rds_dir(CHAPTER), sprintf("presence_%s.rds", tolower(ds)))
+  if (file.exists(f) && !force) {
+    obj <- readRDS(f)
+    if (all(c("dataset", "Genus", "source") %in% names(obj$meta))) {
+      progress("read cached presence", ds)
+      return(obj)
+    }
+  }
+  progress("build presence from CSS", ds)
+  obj <- build_presence(ds)
+  saveRDS(obj, f)
+  obj
+}
+
+pres <- list(
+  `16S` = load_presence("16S", force = FORCE),
+  ITS   = load_presence("ITS", force = FORCE)
+)
+for (k in names(pres)) {
+  cat(sprintf("%s: %d samples x %d mapped ASVs; %.0f%% of samples have a host genus\n",
+              k, ncol(pres[[k]]$presence), length(pres[[k]]$asv),
+              100 * mean(!is.na(pres[[k]]$meta$Genus) &
+                           pres[[k]]$meta$Genus != "")))
+}
+```
+
+# 2. Shared helpers / 公共函数
+
+## 2.1 Representative-T presence per host genus / 代表 T 的宿主属存在矩阵
+
+For every host genus with at least `min_samples` samples, the number of
+representative ASVs `T` is the mean per-sample ASV richness when richness is
+normally distributed (Anderson-Darling, n >= 10) and the median otherwise. The
+`T` most prevalent ASVs of that genus form its representative set, exactly as in
+the species-level pipeline, with the host unit changed from species to genus.
+
+```{r helpers-presence}
+rep_presence <- function(obj, samples, min_samples = 3L, only_genera = NULL,
+                         verbose = FALSE) {
+  meta <- obj$meta
+  if (!length(samples)) {
+    return(list(P = NULL, T = data.table(), n_asv = nrow(obj$presence),
+                n_genera = 0L, n_genera_all = 0L,
+                n_qualified_samples = 0L))
+  }
+  stopifnot(all(samples %in% meta$SampleID))
+  mi <- match(samples, meta$SampleID)
+  gen <- trimws(as.character(meta$Genus[mi]))
+  ok <- !is.na(gen) & gen != "" & gen != "NA"
+  tab <- table(gen[ok])
+  qual <- names(tab)[tab >= min_samples]
+  if (!is.null(only_genera)) qual <- intersect(qual, only_genera)
+  qual <- sort(qual)
+  if (!length(qual)) {
+    return(list(P = NULL, T = data.table(), n_asv = nrow(obj$presence),
+                n_genera = 0L, n_genera_all = length(tab),
+                n_qualified_samples = 0L))
+  }
+  P0 <- obj$presence[, samples, drop = FALSE]
+  n_asv <- nrow(P0)
+  G <- length(qual)
+  Ttab <- data.table(genus = qual, n_samples = NA_integer_,
+                     richness_mean = NA_real_, richness_median = NA_real_,
+                     normality_p = NA_real_, rep_T = NA_integer_)
+  idx_list <- vector("list", G)
+  for (j in seq_len(G)) {
+    cols <- which(ok & gen == qual[j])
+    temp <- P0[, cols, drop = FALSE]
+    prev <- Matrix::rowSums(temp)
+    rs <- Matrix::colSums(temp)
+    n_s <- length(cols)
+    p_val <- NA_real_
+    if (n_s >= 10L) {
+      p_val <- tryCatch(nortest::ad.test(as.numeric(rs))$p.value,
+                        warning = function(w) NA_real_,
+                        error = function(e) NA_real_)
+      if (is.na(p_val)) p_val <- 0
+      T_s <- if (p_val > 0.05) as.integer(mean(rs)) else
+        as.integer(stats::median(rs))
+    } else {
+      T_s <- as.integer(mean(rs))
+    }
+    T_s <- min(max(T_s, 0L), n_asv)
+    idx_list[[j]] <- if (T_s >= 1L) order(-prev)[seq_len(T_s)] else integer(0)
+    Ttab[j, `:=`(n_samples = n_s, richness_mean = mean(rs),
+                 richness_median = stats::median(rs), normality_p = p_val,
+                 rep_T = T_s)]
+  }
+  ii <- unlist(idx_list, use.names = FALSE)
+  jj <- rep(seq_len(G), times = vapply(idx_list, length, integer(1)))
+  P <- Matrix::sparseMatrix(i = ii, j = jj, x = 1,
+                            dims = c(n_asv, G),
+                            dimnames = list(obj$asv, qual))
+  if (verbose) {
+    cat(sprintf("  %d qualified genera; sum(T)=%d; median T=%d\n",
+                G, sum(Ttab$rep_T), as.integer(median(Ttab$rep_T))))
+  }
+  list(P = P, T = Ttab, n_asv = n_asv, n_genera = G,
+       n_genera_all = length(tab),
+       n_qualified_samples = sum(ok & gen %in% qual))
+}
+```
+
+## 2.2 Within-column null, threshold and classification / 列内零模型、阈值与分类
+
+The null shuffles each host-genus column independently, holding the number of
+representative ASVs per genus (`T`) fixed, 1,000 times. The generalist threshold
+is the first host breadth at which the observed number of ASVs exceeds the null
+expectation (crossing method, as in the species-level pipeline).
+
+Throughout this chapter, **host breadth (HB)** is the number of distinct host
+genera in which an ASV is detected. The result tables store it as
+`host_breadth` (range 0-55 across the 16S and ITS data).
+
+```{r helpers-null}
+host_breadth_null <- function(P, n_iter = 1000L, seed = 20261201L) {
+  cs <- Matrix::colSums(P)
+  n_asv <- nrow(P); G <- ncol(P)
+  actual <- tabulate(as.integer(Matrix::rowSums(P)) + 1L, nbins = G + 1L)
+  null <- integer(G + 1L)
+  set.seed(seed)
+  for (it in seq_len(n_iter)) {
+    cnt <- integer(n_asv)
+    for (j in seq_len(G)) {
+      if (cs[j] >= 1L) {
+        sel <- sample.int(n_asv, cs[j])
+        cnt[sel] <- cnt[sel] + 1L
+      }
+    }
+    null <- null + tabulate(cnt + 1L, nbins = G + 1L)
+  }
+  list(actual_count = actual, null_count = null, n_iter = n_iter,
+       col_sums = cs, n_asv = n_asv, n_genera = G,
+       host_breadth = as.integer(Matrix::rowSums(P)))
+}
+
+# Exact expectation of the same within-column null: each column j contributes
+# presence probability p_j = T_j / N independently, so a single ASV follows a
+# Poisson-binomial with probabilities p_j.  This is the analytic mean of the
+# 1,000-shuffle null (verified to agree to <0.3% of counts) and is used for the
+# deterministic O/E, bootstrap and rarefaction calculations.
+pb_pmf <- function(p) {
+  pmf <- c(1, rep(0, length(p)))
+  for (pj in p) pmf <- pmf * (1 - pj) + c(0, pmf[-length(pmf)]) * pj
+  pmf
+}
+pb_counts <- function(Tvec, N) {
+  pmf <- pb_pmf(Tvec / N)
+  cnt <- N * pmf
+  list(pmf = pmf, count = cnt, cum = rev(cumsum(rev(cnt))))
+}
+
+threshold_cross <- function(nr, exact = NULL) {
+  act <- nr$actual_count
+  nul <- nr$null_count / nr$n_iter
+  max_t <- length(act) - 1L
+  above <- which(act[2:length(act)] > nul[2:length(nul)])
+  thr <- if (length(above)) above[1L] else {
+    ts <- 0:max_t
+    max(1L, ceiling(as.numeric(stats::quantile(rep(ts, times = nr$null_count),
+                                               probs = 0.95))))
+  }
+  thr_exact <- NA_integer_
+  if (!is.null(exact)) {
+    above_x <- which(act[2:length(act)] > exact$count[2:length(exact$count)])
+    thr_exact <- if (length(above_x)) above_x[1L] else max(1L, thr)
+  }
+  ts <- 0:max_t
+  list(threshold = thr, threshold_exact = thr_exact,
+       df = data.table(host_breadth = ts, actual = rev(cumsum(rev(act))),
+                       null_expected = rev(cumsum(rev(nul))))
+  )
+}
+
+classify_host_breadth <- function(nh, thr) {
+  ifelse(nh == 0L, "NRH",
+         ifelse(nh == 1L, "specialist",
+                ifelse(nh >= thr, "generalist", "intermediate")))
+}
+```
+
+## 2.3 O/E with host-genus bootstrap CI / O/E 与 bootstrap 置信区间
+
+`O/E = observed generalists / expected generalists under the same null`. The
+confidence interval resamples host genera with replacement 1,000 times; for each
+resample the observed count is recomputed and the expected count is the exact
+Poisson-binomial expectation for the resampled columns at the fixed threshold.
+
+```{r helpers-oe}
+oe_bootstrap <- function(P, k_star, n_asv, Tvec, B = 1000L, seed = 20261202L) {
+  G <- ncol(P)
+  set.seed(seed)
+  obs <- integer(B); expv <- numeric(B)
+  for (b in seq_len(B)) {
+    mult <- tabulate(sample.int(G, G, replace = TRUE), nbins = G)
+    nh <- as.integer(P %*% mult)
+    obs[b] <- sum(nh >= k_star)
+    pmf <- pb_pmf(rep(Tvec, times = mult) / n_asv)
+    expv[b] <- if (k_star < length(pmf))
+      n_asv * sum(pmf[(k_star + 1L):length(pmf)]) else 0
+  }
+  rr <- obs / expv
+  rr[!is.finite(rr)] <- NA_real_
+  list(oe_lo = unname(stats::quantile(rr, 0.025, na.rm = TRUE)),
+       oe_hi = unname(stats::quantile(rr, 0.975, na.rm = TRUE)),
+       obs_mean = mean(obs), exp_mean = mean(expv))
+}
+
+analyze_pool <- function(obj, samples, label, kingdom, grain, seed,
+                         n_iter = 1000L, boot = 1000L, min_samples = 3L,
+                         only_genera = NULL) {
+  t0 <- Sys.time()
+  rp <- rep_presence(obj, samples, min_samples = min_samples,
+                     only_genera = only_genera)
+  if (is.null(rp$P) || rp$n_genera < 2L) {
+    return(list(label = label, kingdom = kingdom, grain = grain,
+                n_samples = length(samples), n_genera = rp$n_genera,
+                n_genera_all = rp$n_genera_all,
+                n_qualified_samples = rp$n_qualified_samples,
+                T = rp$T, P = rp$P, ok = FALSE))
+  }
+  nr <- host_breadth_null(rp$P, n_iter = n_iter, seed = seed)
+  ex <- pb_counts(rp$T$rep_T, rp$n_asv)
+  th <- threshold_cross(nr, ex)
+  cls <- classify_host_breadth(nr$host_breadth, th$threshold)
+  obs <- sum(cls == "generalist")
+  expc <- unname(ex$cum[th$threshold + 1L])
+  oe <- if (expc > 0) obs / expc else NA_real_
+  ci <- oe_bootstrap(rp$P, th$threshold, rp$n_asv, rp$T$rep_T,
+                     B = boot, seed = seed + 7000L)
+  progress(sprintf("pool %s: n=%d G=%d thr=%d GASV=%d O/E=%.2f",
+                   label, length(samples), rp$n_genera, th$threshold,
+                   obs, oe))
+  list(label = label, kingdom = kingdom, grain = grain,
+       n_samples = length(samples), n_genera = rp$n_genera,
+       n_genera_all = rp$n_genera_all,
+       n_qualified_samples = rp$n_qualified_samples,
+       T = rp$T, P = rp$P, nr = nr, th = th, ex = ex,
+       classes = cls, oe = oe, oe_lo = ci$oe_lo, oe_hi = ci$oe_hi,
+       obs = obs, expected = expc,
+       seconds = round(as.numeric(difftime(Sys.time(), t0, units = "secs")), 1))
+}
+```
+
+# 3. Pool definitions / 池定义
+
+Pools are screened by the number of qualified host genera
+(>= 3 samples per genus). A pool enters the analysis when it has at least 10
+qualified genera. Coarse A is `IF_SD`, coarse B is `extract`, and medium is
+`extract x IF_SD`. Pools that additionally stratify by `Region` (the finest,
+region-level grain) are not analysed in v2: they are the smallest pools and the
+most source-dominated (a single source contributes up to 88% of samples in such
+a pool), so region-specific idiosyncrasies would otherwise leak into the
+cross-pool consensus and consistency summaries.
+
+```{r pools-def}
+EXT_LAB <- c(Seed = "Seed", Germinating = "Germ")
+ifsd_vals <- c("SD", "NSD")
+ext_vals  <- c("Seed", "Germinating")
+
+pool_defs <- list()
+add_pool <- function(k, grain, label, samples) {
+  pool_defs[[length(pool_defs) + 1L]] <<- data.table(
+    kingdom = k, grain = grain, label = label, samples = list(samples))
+}
+for (k in c("16S", "ITS")) {
+  md <- md_all[dataset == k]
+  for (v in ifsd_vals) {
+    add_pool(k, "Coarse A", sprintf("%s %s", k, v),
+             md[IF_SD == v, SampleID])
+  }
+  for (v in ext_vals) {
+    add_pool(k, "Coarse B", sprintf("%s %s", k, EXT_LAB[[v]]),
+             md[extract == v, SampleID])
+  }
+  for (e in ext_vals) for (s in ifsd_vals) {
+    add_pool(k, "Medium", sprintf("%s %s/%s", k, EXT_LAB[[e]], s),
+             md[extract == e & IF_SD == s, SampleID])
+  }
+}
+pool_defs <- rbindlist(pool_defs)
+pool_defs[, grain := factor(grain, levels = c("Coarse A", "Coarse B",
+                                              "Medium"))]
+pool_defs[, n_samples := lengths(samples)]
+pool_defs[, n_genera := mapply(function(s, kk) {
+  g <- md_all[dataset == kk][match(s, SampleID), Genus]
+  uniqueN(g[!is.na(g) & g != "" & g != "NA"])
+}, samples, kingdom)]
+pool_defs[, n_qualified := mapply(function(s, kk) {
+  g <- md_all[dataset == kk][match(s, SampleID), Genus]
+  g <- g[!is.na(g) & g != "" & g != "NA"]
+  sum(table(g) >= 3L)
+}, samples, kingdom)]
+pool_defs[, included := n_qualified >= 10L]
+setorder(pool_defs, kingdom, grain, label)
+print(pool_defs[, .(kingdom, grain, label, n_samples, n_genera, n_qualified,
+                    included)])
+```
+
+# 4. Merged analyses (main results) / 合并分析（主结果）
+
+```{r analysis-merged}
+merged_cache <- file.path(rds_dir(CHAPTER), "gos_merged.rds")
+if (file.exists(merged_cache) && !FORCE) {
+  gos_merged <- readRDS(merged_cache)
+  progress("loaded merged analyses cache")
+} else {
+  gos_merged <- list()
+  for (k in c("16S", "ITS")) {
+    seed <- 20261120L + match(k, c("16S", "ITS")) - 1L
+    gos_merged[[k]] <- analyze_pool(
+      pres[[k]], pres[[k]]$meta$SampleID, paste(k, "merged"), k,
+      "Merged", seed = seed)
+  }
+  saveRDS(gos_merged, merged_cache)
+}
+for (k in names(gos_merged)) {
+  r <- gos_merged[[k]]
+  cat(sprintf("%s merged: %d samples, %d genera (%d ASVs); threshold %d; G=%d I=%d S=%d NRH=%d; O/E=%.2f (%.2f-%.2f)\n",
+              k, r$n_samples, r$n_genera, r$n_asv, r$th$threshold,
+              sum(r$classes == "generalist"), sum(r$classes == "intermediate"),
+              sum(r$classes == "specialist"), sum(r$classes == "NRH"),
+              r$oe, r$oe_lo, r$oe_hi))
+}
+```
+
+```{r merged-tables}
+merged_tab <- rbindlist(lapply(names(gos_merged), function(k) {
+  r <- gos_merged[[k]]
+  data.table(kingdom = k, ASV_ID = pres[[k]]$asv, host_breadth = r$nr$host_breadth,
+             category = r$classes, threshold = r$th$threshold,
+             detected = r$nr$host_breadth >= 1)
+}))
+write_tab(merged_tab[kingdom == "16S"], CHAPTER, "Tab_4_gos_merged_16s")
+write_tab(merged_tab[kingdom == "ITS"], CHAPTER, "Tab_4_gos_merged_its")
+```
+
+# 5. Pool analyses / 分池分析
+
+```{r analysis-pools}
+pool_cache <- file.path(rds_dir(CHAPTER), "gos_pools.rds")
+if (file.exists(pool_cache) && !FORCE) {
+  gos_pools <- readRDS(pool_cache)
+  progress("loaded pool analyses cache")
+} else {
+  gos_pools <- list()
+  inc <- pool_defs[included == TRUE]
+  # Seed indices follow the archived pool order so bootstrap CIs are stable
+  # when non-analysis grains are excluded.
+  # 种子序号沿用存档池顺序，保证排除非分析层级后 bootstrap CI 仍可复现。
+  SEED_ORDER <- c(
+    "16S NSD", "16S SD", "16S Germ", "16S Seed", "16S Germ/SD",
+    "16S Seed/NSD", "16S Seed/SD", "16S V3_V4/Seed/SD", "16S V4/Seed/NSD",
+    "16S V4/Seed/SD", "16S V5_V7/Germ/SD", "16S V5_V7/Seed/SD",
+    "ITS NSD", "ITS SD", "ITS Germ", "ITS Seed", "ITS Germ/SD",
+    "ITS Seed/NSD", "ITS Seed/SD", "ITS1 Germ/SD", "ITS1 Seed/NSD",
+    "ITS1 Seed/SD", "ITS2 Seed/SD")
+  for (i in seq_len(nrow(inc))) {
+    d <- inc[i]
+    seed_i <- match(d$label, SEED_ORDER)
+    stopifnot(!is.na(seed_i))
+    seed <- 20261210L + 10L * (seed_i - 1L)
+    obj <- pres[[d$kingdom]]
+    res <- analyze_pool(obj, d$samples[[1]], d$label, d$kingdom, d$grain,
+                        seed = seed)
+    gos_pools[[d$label]] <- res
+  }
+  saveRDS(gos_pools, pool_cache)
+}
+# Pools are fitted independently with fixed seeds, so retaining only the
+# analysis grains is numerically identical to recomputing those pools.
+# 各池独立拟合且种子固定，仅保留分析层级与重算等价。
+n_before_filter <- length(gos_pools)
+gos_pools <- gos_pools[!vapply(gos_pools, function(r)
+  as.character(r$grain)[1] == "Fine", logical(1))]
+if (n_before_filter != length(gos_pools)) {
+  progress(sprintf("dropped %d cached Fine pools; %d qualified pools retained",
+                   n_before_filter - length(gos_pools), length(gos_pools)))
+}
+stopifnot(all(vapply(gos_pools, function(r)
+  as.character(r$grain)[1] != "Fine", logical(1))))
+cat("Qualified pools analysed:", length(gos_pools), "\n")
+print(rbindlist(lapply(gos_pools, function(r) data.table(
+  pool = r$label, kingdom = r$kingdom, grain = r$grain, n = r$n_samples,
+  G = r$n_genera, thr = r$th$threshold,
+  generalist = sum(r$classes == "generalist"),
+  O_E = round(r$oe, 2)))))
+```
+
+## 5.1 Pool summary / 池汇总
+
+```{r pool-summary}
+pool_summary <- rbindlist(lapply(seq_len(nrow(pool_defs)), function(i) {
+  d <- pool_defs[i]
+  md <- md_all[dataset == d$kingdom][match(d$samples[[1]], SampleID)]
+  top_source <- if (nrow(md)) max(prop.table(table(md$source))) else NA_real_
+  r <- gos_pools[[d$label]]
+  if (is.null(r) || is.null(r$nr)) {
+    return(data.table(
+      kingdom = d$kingdom, grain = as.character(d$grain), pool = d$label,
+      n_samples = d$n_samples, n_genera = d$n_genera,
+      n_qualified = d$n_qualified, n_qualified_samples = NA_integer_,
+      threshold = NA_integer_, null_expected = NA_real_,
+      generalist = NA_integer_, intermediate = NA_integer_,
+      specialist = NA_integer_, NRH = NA_integer_,
+      O_E = NA_real_, O_E_lo = NA_real_, O_E_hi = NA_real_,
+      top_source_share = top_source, included = FALSE,
+      exclusion = "fewer than 10 qualified genera"))
+  }
+  data.table(
+    kingdom = d$kingdom, grain = as.character(d$grain), pool = d$label,
+    n_samples = r$n_samples, n_genera = r$n_genera_all,
+    n_qualified = r$n_genera, n_qualified_samples = r$n_qualified_samples,
+    threshold = r$th$threshold, null_expected = round(r$expected, 2),
+    generalist = sum(r$classes == "generalist"),
+    intermediate = sum(r$classes == "intermediate"),
+    specialist = sum(r$classes == "specialist"),
+    NRH = sum(r$classes == "NRH"),
+    O_E = round(r$oe, 3), O_E_lo = round(r$oe_lo, 3),
+    O_E_hi = round(r$oe_hi, 3),
+    top_source_share = round(top_source, 3), included = TRUE,
+    exclusion = NA_character_)
+}), fill = TRUE)
+pool_summary[, grain := factor(grain, levels = c("Coarse A", "Coarse B",
+                                                 "Medium"))]
+setorder(pool_summary, kingdom, grain, pool)
+print(pool_summary)
+write_tab(pool_summary, CHAPTER, "Tab_4_pool_summary")
+
+# ASV x pool classification long table
+asv_classification <- rbindlist(lapply(gos_pools, function(r) {
+  data.table(ASV_ID = pres[[r$kingdom]]$asv, kingdom = r$kingdom,
+             grain = as.character(r$grain), pool = r$label,
+             host_breadth = r$nr$host_breadth, category = r$classes,
+             threshold = r$th$threshold)
+}))
+write_tab(asv_classification, CHAPTER, "Tab_4_asv_classification")
+```
+
+## 5.2 Consensus generalists across pools / 跨池一致通才
+
+```{r consensus}
+pool_map <- unique(asv_classification[, .(pool, grain)])
+cons <- asv_classification[, .(
+  n_pools = .N,
+  n_detected = sum(host_breadth >= 1),
+  n_generalist = sum(category == "generalist")),
+  by = .(kingdom, ASV_ID)]
+grains <- asv_classification[category == "generalist",
+                             .(generalist_grains = paste(sort(unique(as.character(grain))),
+                                                         collapse = ",")),
+                             by = .(kingdom, ASV_ID)]
+cons <- merge(cons, grains, by = c("kingdom", "ASV_ID"), all.x = TRUE)
+cons[, frac_generalist := n_generalist / pmax(n_detected, 1L)]
+cons[, consensus := fifelse(n_detected == 0L, "undetected",
+  fifelse(frac_generalist >= 0.5, "stable",
+  fifelse(n_generalist >= 1L, "contextual", "never_generalist")))]
+write_int(cons, CHAPTER, "generalist_sets")
+cat("Consensus classes:\n"); print(cons[, .N, by = .(kingdom, consensus)])
+```
+
+## 5.3 Recurrent generalist annotation across qualified pools / 复发性通才注释
+
+An ASV can cross the pool-specific threshold in one pool but not in another,
+because both the threshold and the within-pool host breadth change. For every
+ASV we therefore count the number of qualified pools of its kingdom in which it
+was annotated as a generalist (denominator: the 7 qualified 16S pools and the
+7 qualified ITS pools). Ties were broken by merged host breadth (`host_breadth`),
+then by the number of pools in which the ASV was detected, then by `ASV_ID`. The
+top 100 bacteria and top 100 fungi are reported with their reference taxonomy
+(SILVA / UNITE); species-level labels are shown as annotated and are frequently
+unassigned, especially for 16S.
+
+```{r generalist-counts}
+gen_counts <- cons[, .(kingdom, ASV_ID, n_pools,
+                       n_detected_pools = n_detected,
+                       n_generalist_pools = n_generalist)]
+tax_flat <- rbindlist(lapply(names(tax_all), function(k) {
+  d <- tax_all[[k]][, c("taxid", "Phylum", "Class", "Order", "Family", "Genus",
+                        "Species"), with = FALSE]
+  setnames(d, "taxid", "ASV_ID")
+  d[, kingdom := k]
+  d
+}))
+gen_counts <- merge(gen_counts, tax_flat, by = c("kingdom", "ASV_ID"), all.x = TRUE)
+gen_counts <- merge(
+  gen_counts,
+  merged_tab[, .(kingdom, ASV_ID, host_breadth_merged = host_breadth,
+                 merged_category = category, merged_detected = detected)],
+  by = c("kingdom", "ASV_ID"), all.x = TRUE)
+stopifnot(!anyNA(gen_counts$Phylum))
+gen_counts[, frac_generalist_pools := n_generalist_pools / n_pools]
+setorder(gen_counts, kingdom, -n_generalist_pools, -host_breadth_merged,
+         -n_detected_pools, ASV_ID)
+gen_counts[, rank := seq_len(.N), by = kingdom]
+setcolorder(gen_counts, c("kingdom", "rank", "ASV_ID", "n_generalist_pools",
+                          "n_pools", "n_detected_pools", "frac_generalist_pools",
+                          "host_breadth_merged", "merged_category", "merged_detected",
+                          "Phylum", "Class", "Order", "Family", "Genus", "Species"))
+write_tab(gen_counts, CHAPTER, "Tab_4_generalist_pool_counts")
+top_gen <- gen_counts[rank <= 100L]
+write_tab(top_gen, CHAPTER, "Tab_4_generalist_top100_taxonomy")
+print(top_gen[, .N, by = .(kingdom, n_generalist_pools)][order(kingdom, -n_generalist_pools)])
+```
+
+# 6. Comparisons and bias controls / 比较与偏倚控制
+
+## 6.1 Matched-genus contrasts / 匹配属对比
+
+Pools differ in their host-genus coverage. For each pair the contrast is repeated
+on the intersection of qualified genera, so that both pools are evaluated on the
+same host units.
+
+```{r matched-pairs}
+pairs <- list(
+  c("16S SD", "16S NSD"), c("ITS SD", "ITS NSD"),
+  c("16S Seed", "16S Germ"), c("ITS Seed", "ITS Germ"),
+  c("16S Seed/SD", "16S Seed/NSD"), c("ITS Seed/SD", "ITS Seed/NSD"),
+  c("16S Seed/SD", "16S Germ/SD"), c("ITS Seed/SD", "ITS Germ/SD")
+)
+matched_cache <- file.path(rds_dir(CHAPTER), "gos_matched.rds")
+if (file.exists(matched_cache) && !FORCE) {
+  matched <- readRDS(matched_cache)
+} else {
+  matched <- list()
+  for (i in seq_along(pairs)) {
+    a <- gos_pools[[pairs[[i]][1]]]
+    b <- gos_pools[[pairs[[i]][2]]]
+    if (is.null(a) || is.null(b)) next
+    common <- intersect(a$T$genus, b$T$genus)
+    if (length(common) < 2L) next
+    ra <- analyze_pool(pres[[a$kingdom]], pool_defs[label == a$label, samples][[1]],
+                       paste0(a$label, " [matched]"), a$kingdom, a$grain,
+                       seed = 20261400L + 10L * i, boot = 500L,
+                       only_genera = common)
+    rb <- analyze_pool(pres[[b$kingdom]], pool_defs[label == b$label, samples][[1]],
+                       paste0(b$label, " [matched]"), b$kingdom, b$grain,
+                       seed = 20261400L + 10L * i + 1L, boot = 500L,
+                       only_genera = common)
+    matched[[length(matched) + 1L]] <- data.table(
+      pair = paste(a$label, "vs", b$label),
+      n_common_genera = length(common),
+      pool_a = a$label, pool_b = b$label,
+      OE_a = ra$oe, OE_lo_a = ra$oe_lo, OE_hi_a = ra$oe_hi,
+      OE_b = rb$oe, OE_lo_b = rb$oe_lo, OE_hi_b = rb$oe_hi,
+      d_OE = ra$oe - rb$oe)
+  }
+  matched <- rbindlist(matched)
+  saveRDS(matched, matched_cache)
+}
+print(matched)
+write_int(matched, CHAPTER, "matched_genus_contrasts")
+```
+
+## 6.2 Three seed scenarios (Seed/SD, SD, Seed/NSD) / 三种种子情景
+
+```{r scenarios}
+scen_cache <- file.path(rds_dir(CHAPTER), "gos_scenarios.rds")
+if (file.exists(scen_cache) && !FORCE) {
+  scenarios <- readRDS(scen_cache)
+} else {
+  scenarios <- list()
+  for (k in c("16S", "ITS")) {
+    psd <- gos_pools[[sprintf("%s Seed/SD", k)]]
+    pall <- gos_pools[[sprintf("%s SD", k)]]
+    pnsd <- gos_pools[[sprintf("%s Seed/NSD", k)]]
+    if (is.null(psd) || is.null(pall) || is.null(pnsd)) next
+    asv <- pres[[k]]$asv
+    cls_sd <- psd$classes; cls_all <- pall$classes; cls_nsd <- pnsd$classes
+    new_epi <- cls_nsd == "generalist" & cls_sd != "generalist" &
+      pnsd$nr$host_breadth >= 1
+    lost <- cls_sd == "generalist" & cls_nsd != "generalist"
+    abund <- pres[[k]]$mean_css
+    detected_nsd <- pnsd$nr$host_breadth >= 1
+    share_new <- sum(abund[new_epi]) / sum(abund[detected_nsd])
+    tax <- tax_all[[k]][match(asv, taxid)]
+    top_phy <- data.table(ASV_ID = asv[new_epi],
+                          Phylum = tax$Phylum[new_epi])[
+      , .N, by = Phylum][order(-N)][1:min(5, .N)]
+    scenarios[[length(scenarios) + 1L]] <- data.table(
+      kingdom = k,
+      n_generalist_seed_sd = sum(cls_sd == "generalist"),
+      n_generalist_sd = sum(cls_all == "generalist"),
+      n_generalist_seed_nsd = sum(cls_nsd == "generalist"),
+      n_new_in_seed_nsd = sum(new_epi),
+      n_lost_from_seed_sd = sum(lost),
+      abundance_share_new = share_new,
+      top_phyla_new = paste(sprintf("%s(%d)", top_phy$Phylum, top_phy$N),
+                            collapse = "; "))
+  }
+  scenarios <- rbindlist(scenarios)
+  saveRDS(scenarios, scen_cache)
+}
+print(scenarios)
+write_tab(scenarios, CHAPTER, "Tab_4_scenarios")
+```
+
+## 6.3 Rarefaction of qualified host genera / 合格宿主属稀释
+
+```{r rarefaction}
+rare_cache <- file.path(rds_dir(CHAPTER), "gos_rarefaction.rds")
+if (file.exists(rare_cache) && !FORCE) {
+  rarefaction <- readRDS(rare_cache)
+} else {
+  rare_one <- function(r, seed, n_draw = 200L) {
+    P <- r$P; N <- r$nr$n_asv; G <- ncol(P); Tj <- r$T$rep_T
+    k_star <- r$th$threshold
+    ks <- unique(c(seq(5L, min(G, 60L), by = 1L),
+                   if (G > 60L) as.integer(seq(65L, G, length.out = 8L))))
+    ks <- ks[ks <= G]
+    set.seed(seed)
+    rbindlist(lapply(ks, function(kk) {
+      obs <- integer(n_draw); expv <- numeric(n_draw); det <- integer(n_draw)
+      for (b in seq_len(n_draw)) {
+        sub <- sample.int(G, kk)
+        nh <- as.integer(Matrix::rowSums(P[, sub, drop = FALSE]))
+        obs[b] <- sum(nh >= k_star)
+        det[b] <- sum(nh >= 1)
+        pmf <- pb_pmf(Tj[sub] / N)
+        expv[b] <- if (k_star < length(pmf))
+          N * sum(pmf[(k_star + 1L):length(pmf)]) else 0
+      }
+      oe <- obs / expv
+      # With very few genera the null expectation is < 1 ASV and O/E is
+      # numerically unstable; mark those draws missing rather than report
+      # six-figure ratios.
+      oe[!is.finite(oe) | expv < 1] <- NA_real_
+      data.table(k_genera = kk, n_draw = n_draw,
+                 mean_detected = mean(det),
+                 generalist_rate = mean(obs) / N,
+                 expected_count = mean(expv),
+                 O_E = mean(oe, na.rm = TRUE),
+                 O_E_lo = unname(stats::quantile(oe, 0.025, na.rm = TRUE)),
+                 O_E_hi = unname(stats::quantile(oe, 0.975, na.rm = TRUE)))
+    }))
+  }
+  rarefaction <- rbindlist(lapply(names(gos_merged), function(k) {
+    d <- rare_one(gos_merged[[k]],
+                  seed = 20261500L + match(k, c("16S", "ITS")))
+    d[, kingdom := k]
+    d
+  }))
+  saveRDS(rarefaction, rare_cache)
+}
+print(rarefaction[seq(1, .N, by = max(1, floor(.N / 12)))])
+write_tab(rarefaction, CHAPTER, "Tab_4_rarefaction")
+```
+
+## 6.4 Leave-one-source-out stability (merged analysis) / 留一来源稳定性
+
+```{r loo-source}
+loo_cache <- file.path(rds_dir(CHAPTER), "gos_loo_source.rds")
+if (file.exists(loo_cache) && !FORCE && !RERUN_LOO) {
+  loo <- readRDS(loo_cache)
+} else {
+  loo_one <- function(k, seed, min_samples = 3L) {
+    obj <- pres[[k]]
+    full <- gos_merged[[k]]
+    full_set <- obj$asv[full$classes == "generalist"]
+    srcs <- sort(unique(obj$meta$source))
+    rbindlist(lapply(seq_along(srcs), function(i) {
+      drop_s <- srcs[i]
+      keep <- obj$meta$SampleID[obj$meta$source != drop_s]
+      rp <- rep_presence(obj, keep, min_samples = min_samples)
+      if (is.null(rp$P) || rp$n_genera < 2L) return(NULL)
+      nh <- as.integer(Matrix::rowSums(rp$P))
+      ex <- pb_counts(rp$T$rep_T, rp$n_asv)
+      act <- tabulate(nh + 1L, nbins = rp$n_genera + 1L)
+      above <- which(rev(cumsum(rev(act)))[2:(rp$n_genera + 1L)] >
+                       ex$cum[2:(rp$n_genera + 1L)])
+      thr <- if (length(above)) above[1L] else 1L
+      cls <- classify_host_breadth(nh, thr)
+      gset <- obj$asv[cls == "generalist"]
+      data.table(kingdom = k, dropped_source = drop_s,
+                 n_samples = length(keep), n_genera = rp$n_genera,
+                 threshold = thr, n_generalist = length(gset),
+                 jaccard_vs_full = length(intersect(gset, full_set)) /
+                   length(union(gset, full_set)),
+                 stable_retained = length(intersect(
+                   gset, obj$asv[full$classes == "generalist" &
+                                   full$nr$host_breadth >= 1])) /
+                   max(1L, length(full_set)))
+    }))
+  }
+  loo <- rbindlist(lapply(c("16S", "ITS"), function(k)
+    loo_one(k, seed = 20261600L + match(k, c("16S", "ITS")))))
+  saveRDS(loo, loo_cache)
+}
+cat(sprintf("LOO source: %d runs; Jaccard median %.3f (min %.3f)\n",
+            nrow(loo), median(loo$jaccard_vs_full), min(loo$jaccard_vs_full)))
+write_int(loo, CHAPTER, "loo_source_stability")
+```
+
+# 7. Host-breadth slope (HBS) across taxonomic ranks / 跨分类阶元宿主广度斜率
+
+For each microbial taxon the host-breadth slope is the logistic coefficient of
+`y_i = 1(ASV i belongs to the taxon)` on log2(host breadth) among ASVs with
+host breadth >= 1 (the OHA term is not used in v2). Higher ranks are evaluated
+at phylum and order for 16S and at class and order for ITS (class is the highest
+rank resolved consistently in the UNITE taxonomy); both kingdoms also include
+genus. Taxa need >= 20 ASVs and >= 3 distinct host-breadth values. FDR is
+Benjamini-Hochberg within each taxonomic rank.
+
+```{r hbs-helpers}
+valid_taxon <- function(x) {
+  !is.na(x) & x != "" &
+    !x %in% c("Unassigned", "Incertae Sedis", "uncultured",
+              "Unknown", "unclassified", "NA")
+}
+
+fit_hbs_rank <- function(cl, tax, rank_name, min_asv = 20L, min_h = 3L) {
+  m <- merge(cl[, .(ASV_ID, host_breadth)],
+             tax[, c("taxid", rank_name), with = FALSE],
+             by.x = "ASV_ID", by.y = "taxid", all.x = TRUE)
+  setnames(m, rank_name, "taxon")
+  m <- m[valid_taxon(taxon)]
+  tot <- m[host_breadth >= 1, .(n_total = .N), by = .(h = host_breadth)][order(h)]
+  N_pos <- sum(tot$n_total)
+  meta <- m[, .(total_asv_all = .N, n_h_all = uniqueN(host_breadth)), by = taxon]
+  keep <- meta[total_asv_all >= min_asv & n_h_all >= min_h, taxon]
+  gcnt <- m[host_breadth >= 1, .(n_in = .N), by = .(taxon, h = host_breadth)]
+  out <- rbindlist(lapply(keep, function(g) {
+    d <- merge(tot, gcnt[taxon == g, .(h, n_in)], by = "h", all.x = TRUE)
+    d[is.na(n_in), n_in := 0L]
+    d <- d[order(h)]
+    if (nrow(d) < 3L || sum(d$n_in) == 0L) return(NULL)
+    d[, x := log2(h)]
+    fit <- tryCatch(suppressWarnings(
+      glm(cbind(n_in, n_total - n_in) ~ x, data = d, family = binomial(),
+          control = glm.control(maxit = 100))), error = function(e) NULL)
+    if (is.null(fit)) return(NULL)
+    co <- summary(fit)$coefficients
+    if (!"x" %in% rownames(co)) return(NULL)
+    b <- co["x", "Estimate"]; se <- co["x", "Std. Error"]
+    p <- co["x", ncol(co)]
+    data.table(
+      rank = rank_name, taxon = g,
+      total_asv_all = meta[taxon == g, total_asv_all],
+      total_asv_pos = sum(d$n_in), n_h_all = meta[taxon == g, n_h_all],
+      n_h_pos = nrow(d), prev_overall_pos = sum(d$n_in) / N_pos,
+      log2OR = b, OR = exp(b), OR_lo = exp(b - 1.96 * se),
+      OR_hi = exp(b + 1.96 * se), p = p,
+      direction = ifelse(b > 0, "Increasing", "Decreasing"),
+      converged = isTRUE(fit$converged))
+  }), fill = TRUE)
+  if (!nrow(out)) return(NULL)
+  out[, FDR := p.adjust(p, method = "BH")]
+  out[, star := ifelse(FDR < 0.001, "***", ifelse(FDR < 0.01, "**",
+                  ifelse(FDR < 0.05, "*", "")))]
+  out[]
+}
+
+fit_hbs_all <- function(cl, tax, ranks = c("Phylum", "Order", "Genus")) {
+  rbindlist(lapply(ranks, function(rk) fit_hbs_rank(cl, tax, rk)),
+            fill = TRUE)
+}
+
+# Higher ranks differ by kingdom: 16S has a resolved phylum, whereas the
+# UNITE ITS taxonomy is only consistently resolved from class downwards.
+HBS_RANKS <- list(
+  `16S` = c("Phylum", "Order", "Genus"),
+  ITS   = c("Class", "Order", "Genus")
+)
+```
+
+```{r hbs-merged}
+hbs_cache <- file.path(rds_dir(CHAPTER), "hbs_merged.rds")
+if (file.exists(hbs_cache) && !FORCE) {
+  hbs_merged <- readRDS(hbs_cache)
+} else {
+  hbs_merged <- list()
+  for (k in c("16S", "ITS")) {
+    cl <- merged_tab[kingdom == k]
+    hbs_merged[[k]] <- fit_hbs_all(cl, tax_all[[k]], HBS_RANKS[[k]])
+  }
+  saveRDS(hbs_merged, hbs_cache)
+}
+for (k in names(hbs_merged)) {
+  cat(k, "HBS tested by rank:\n")
+  print(hbs_merged[[k]][, .(n_tested = .N,
+    n_sig = sum(FDR < 0.05), n_up = sum(FDR < 0.05 & OR > 1),
+    n_down = sum(FDR < 0.05 & OR < 1)), by = rank])
+}
+host_genus_logistic <- rbindlist(lapply(names(hbs_merged), function(k) {
+  d <- hbs_merged[[k]][rank == "Genus"]
+  if (!nrow(d)) return(NULL)
+  cbind(kingdom = k, d)
+}))
+write_tab(host_genus_logistic, CHAPTER, "Tab_4_host_genus_logistic")
+```
+
+```{r hbs-by-pool}
+hbs_pool_cache <- file.path(rds_dir(CHAPTER), "hbs_bypool.rds")
+if (file.exists(hbs_pool_cache) && !FORCE) {
+  hbs_bypool <- readRDS(hbs_pool_cache)
+} else {
+  hbs_bypool <- rbindlist(lapply(names(gos_pools), function(lbl) {
+    r <- gos_pools[[lbl]]
+    cl <- data.table(ASV_ID = pres[[r$kingdom]]$asv,
+                     host_breadth = r$nr$host_breadth)
+    d <- fit_hbs_rank(cl, tax_all[[r$kingdom]], "Genus")
+    if (is.null(d)) return(NULL)
+    cbind(kingdom = r$kingdom, grain = as.character(r$grain), pool = lbl, d)
+  }), fill = TRUE)
+  saveRDS(hbs_bypool, hbs_pool_cache)
+}
+# Pool fits are independent; keep only the retained grains.
+# 池拟合相互独立，仅保留最终层级。
+hbs_bypool <- hbs_bypool[grain != "Fine"]
+cat(sprintf("By-pool HBS: %d genus x pool tests; %d significant positive\n",
+            nrow(hbs_bypool), sum(hbs_bypool$FDR < 0.05 & hbs_bypool$OR > 1)))
+write_int(hbs_bypool, CHAPTER, "hbs_bypool_genus")
+```
+
+# 8. Phylogenetic signal on the microbial tree / 微生物树上的系统发育信号
+
+The microbial tree for this chapter is built de novo from the **10,372 16S
+ASVs with host breadth >= 1** in the merged genus-level analysis (ASVs never
+detected in a qualified host genus are excluded from both the alignment and
+the tree). The server recipe is MAFFT `--auto` -> trimAl `-automated1` ->
+FastTreeMP (`-nt -gtr -gamma`), followed by midpoint rooting with
+`midpoint_root_ape.R`. `lambda`/`K` were run with `phylosig_fast.R` (pruning
+lambda, 1,000-permutation Blomberg K) and Fritz & Purvis `D` with
+`phylo_d_fast.R`; the per-tip trait is the genus-level host breadth / generalist
+status from the merged analysis. The tree and statistics are supplied under
+`server_result/ch4/`; the rebuild commands are in `scripts/server/ch4_gos_tree.sh`
+and `scripts/server/ch4_phylosig_D.R`.
+树与统计量随 `server_result/ch4/` 提供；重建脚本见 `scripts/server/`。
+
+```{r tree-stats}
+TREE_DIR <- tree_dir(CHAPTER)
+tree_file <- file.path(TREE_DIR, "gos_hostn_pos_16s_midpoint.nwk")
+if (!file.exists(tree_file)) {
+  stop("gos_hostn_pos_16s_midpoint.nwk missing; provide server_result/ch4/",
+       call. = FALSE)
+}
+phy_stats_file <- file.path(ch_dir(CHAPTER, "tables"), "Tab_4_tree_phylosig.tsv")
+d_stats_file <- file.path(ch_dir(CHAPTER, "tables"),
+                          "Tab_4_tree_generalist_D.tsv")
+if (!file.exists(phy_stats_file) || !file.exists(d_stats_file)) {
+  stop("Tab_4_tree_phylosig.tsv or Tab_4_tree_generalist_D.tsv missing; ",
+       "provide server_result/ch4/", call. = FALSE)
+}
+phy_stats <- fread(phy_stats_file)
+d_stats <- fread(d_stats_file)
+print(phy_stats); print(d_stats)
+```
+
+## 8.5 Intermediate products / 中间产物
+
+```{r intermediates}
+pool_definitions <- pool_defs[, .(kingdom, grain = as.character(grain),
+                                   pool = label, n_samples, n_genera,
+                                   n_qualified, included)]
+write_int(pool_definitions, CHAPTER, "pool_definitions")
+
+pool_samples <- rbindlist(lapply(seq_len(nrow(pool_defs)), function(i) {
+  data.table(kingdom = pool_defs$kingdom[i], pool = pool_defs$label[i],
+             SampleID = pool_defs$samples[[i]])
+}))
+write_int(pool_samples, CHAPTER, "pool_samples")
+
+qualified_genera <- rbindlist(lapply(gos_pools, function(r) {
+  cbind(kingdom = r$kingdom, pool = r$label, copy(r$T))
+}))
+write_int(qualified_genera, CHAPTER, "pool_qualified_genera")
+
+thresholds <- rbindlist(lapply(gos_pools, function(r) {
+  k <- r$th$threshold
+  data.table(kingdom = r$kingdom, pool = r$label, threshold = k,
+             actual_count_at_threshold = r$nr$actual_count[k + 1L],
+             null_expected_at_threshold = round(r$ex$count[k + 1L], 4),
+             n_genera = r$n_genera, n_asv = r$nr$n_asv)
+}))
+write_int(thresholds, CHAPTER, "pool_thresholds")
+
+null_draws <- rbindlist(lapply(gos_pools, function(r) {
+  data.table(kingdom = r$kingdom, pool = r$label,
+             host_breadth = 0:r$n_genera,
+             actual_count = r$nr$actual_count,
+             null_count = r$nr$null_count, n_iter = r$nr$n_iter)
+}))
+write_int(null_draws, CHAPTER, "host_breadth_null_draws")
+
+presence_summary <- rbindlist(lapply(gos_pools, function(r) {
+  data.table(kingdom = r$kingdom, pool = r$label,
+             n_asv = r$nr$n_asv,
+             n_detected = sum(r$nr$host_breadth >= 1),
+             n_genera = r$n_genera,
+             T_min = min(r$T$rep_T), T_median = median(r$T$rep_T),
+             T_max = max(r$T$rep_T))
+}))
+write_int(presence_summary, CHAPTER, "presence_summary")
+
+write_int(hbs_bypool[FDR < 0.05 & OR > 1], CHAPTER, "pool_genera_positive")
+write_int(hbs_bypool, CHAPTER, "pool_trait_tests")
+
+hbs_all <- rbindlist(lapply(names(hbs_merged), function(k) {
+  if (!nrow(hbs_merged[[k]])) return(NULL)
+  cbind(kingdom = k, hbs_merged[[k]])
+}))
+write_int(hbs_all, CHAPTER, "hostn_logistic_raw")
+
+# Aggregate RDS objects named in the v2 file structure
+save_rds(lapply(gos_pools, `[[`, "P"), CHAPTER, "presence_matrices")
+save_rds(lapply(gos_pools, function(r) r$nr), CHAPTER, "host_breadth_null_draws")
+save_rds(list(classification = asv_classification, consensus = cons,
+              merged = merged_tab), CHAPTER, "gos_classification")
+save_rds(list(merged = hbs_merged, bypool = hbs_bypool), CHAPTER,
+         "logistic_models")
+saveRDS(ape::read.tree(tree_file),
+        file.path(rds_dir(CHAPTER), "microbial_tree.rds"))
+```
+
+# 9. Figures / 图件
+
+## 9.1 Generalist threshold (16S and ITS) / 通才阈值
+
+```{r fig-threshold}
+th_plot <- function(r, colour) {
+  max_k <- min(r$nr$n_genera, 50L)
+  ts <- 1:max_k
+  df <- data.table(host_breadth = ts,
+                   Actual = as.numeric(r$nr$actual_count[ts + 1L]),
+                   Null = r$nr$null_count[ts + 1L] / r$nr$n_iter)
+  df_long <- melt(df, id.vars = "host_breadth", variable.name = "distribution",
+                  value.name = "count")
+  df_long[, distribution := factor(distribution,
+                                   levels = c("Actual", "Null"))]
+  ggplot(df_long, aes(x = host_breadth, y = log10(count + 1),
+                      fill = distribution)) +
+    geom_col(position = position_dodge(width = 0.8), width = 0.7,
+             colour = NA, alpha = 0.9) +
+    geom_vline(xintercept = r$th$threshold, linetype = "dashed",
+               colour = "firebrick", linewidth = 0.5) +
+    scale_fill_manual(values = c(Actual = colour, Null = "grey65"),
+                      labels = c(Actual = "Observed", Null = "Null")) +
+    scale_y_continuous(breaks = log10(c(0, 1, 10, 100, 1000, 10000) + 1),
+                       labels = c("0", "1", "10", "100", "1,000", "10,000")) +
+    labs(x = "Host breadth (no. of host genera)",
+         y = "Number of ASVs (log10 scale)", fill = NULL) +
+    theme_seed(8) +
+    theme(legend.position = "bottom")
+}
+p16 <- th_plot(gos_merged[["16S"]], "#3A5A40")
+pit <- th_plot(gos_merged[["ITS"]], "#D97B29")
+p_th <- p16 + pit + plot_layout(ncol = 2, guides = "collect") &
+  theme(legend.position = "bottom")
+save_fig(p_th, CHAPTER, "Fig_4_threshold_16s_its", 180, 80)
+embed_fig(CHAPTER, "Fig_4_threshold_16s_its")
+```
+
+## 9.2 Phylum (16S) and class (ITS) composition across categories / 分类组成桑基图
+
+```{r sankey-fun}
+sankey_plot <- function(cl, tax, taxon_cols, top_n = 10L, rank_col = "Phylum",
+                        node_labels = TRUE) {
+  m <- merge(cl[, .(ASV_ID, host_breadth, category)],
+             tax[, .(ASV_ID = taxid, Taxon = get(rank_col))],
+             by = "ASV_ID", all.x = TRUE)
+  m[is.na(Taxon) | Taxon == "", Taxon := "Unassigned"]
+  m[, Category := factor(
+    fifelse(category == "generalist", "Generalist",
+      fifelse(category == "specialist", "Specialist",
+        fifelse(category == "intermediate", "Intermediate", "NRH"))),
+    levels = c("Generalist", "Intermediate", "Specialist", "NRH"))]
+  top100 <- m[order(-host_breadth, ASV_ID)][1:100]
+  top100[, Category := "Top100 host breadth"]
+  cat_levels <- c("Top100 host breadth", "Generalist", "Intermediate", "Specialist")
+  m4 <- rbind(
+    m[Category %in% c("Generalist", "Intermediate", "Specialist")][
+      , .(Category = as.character(Category), Taxon)],
+    top100[, .(Category = "Top100 host breadth", Taxon)])
+  m4[, Category := factor(Category, levels = cat_levels)]
+  cnt <- m4[, .(n = .N), by = .(Category, Taxon)]
+  cnt <- cnt[order(Category, -n, Taxon)]
+  top <- cnt[, head(.SD, top_n), by = Category]
+  nodes0 <- rbindlist(lapply(cat_levels, function(cc) {
+    d <- cnt[Category == cc]
+    tops <- top[Category == cc, Taxon]
+    d[, Node := fifelse(Taxon %in% tops, Taxon, "Other")]
+    d <- d[, .(n = sum(n)), by = Node]
+    if (!"Other" %in% d$Node) d <- rbind(d, data.table(Node = "Other", n = 0L))
+    d[, Category := cc]
+    d
+  }))
+  nodes0[, Category := factor(Category, levels = cat_levels)]
+  nodes0[, frac := n / sum(n), by = Category]
+  glob <- m4[, .(total = .N), by = Taxon][order(-total, Taxon)]
+  union_nodes <- unique(c(top$Taxon, "Other"))
+  stack_levels <- c("Other", rev(intersect(glob$Taxon, union_nodes)))
+  nodes <- nodes0[order(Category, match(Node, stack_levels))]
+  nodes[, `:=`(ymax = cumsum(frac), ymin = cumsum(frac) - frac), by = Category]
+  nodes[, x := as.numeric(Category)]
+  W <- 0.32 * 1.15
+  ribbon_df <- function(x1, x2, y1min, y1max, y2min, y2max, id, taxon,
+                        type, n = 80L) {
+    tt <- seq(0, 1, length.out = n)
+    ss <- tt * tt * (3 - 2 * tt)
+    data.table(x = x1 + (x2 - x1) * tt,
+               ymin = y1min + (y2min - y1min) * ss,
+               ymax = y1max + (y2max - y1max) * ss,
+               id = id, Taxon = taxon, type = type)
+  }
+  pairs_l <- list(c("Top100 host breadth", "Generalist"),
+                  c("Generalist", "Intermediate"),
+                  c("Intermediate", "Specialist"))
+  ribbons <- list(); k <- 0L
+  for (pair in pairs_l) {
+    L <- nodes[Category == pair[1]]; R <- nodes[Category == pair[2]]
+    for (i in seq_len(nrow(L))) {
+      if (L$n[i] == 0L) next
+      p <- L$Node[i]
+      target <- if (p == "Other") "Other" else if (p %in% R$Node) p else "Other"
+      rr <- R[Node == target]
+      if (!nrow(rr) || rr$n[1] == 0L) next
+      k <- k + 1L
+      ribbons[[k]] <- ribbon_df(L$x[i] + W / 2, rr$x[1] - W / 2,
+                                L$ymin[i], L$ymax[i], rr$ymin[1], rr$ymax[1],
+                                k, p, ifelse(p == "Other", "other",
+                                  ifelse(target == p, "shared", "dropout")))
+    }
+    extra <- setdiff(R$Node, c(L$Node, "Other"))
+    lo <- L[Node == "Other"]
+    if (length(extra) && nrow(lo) && lo$n[1] > 0L) {
+      for (p in extra) {
+        rr <- R[Node == p]
+        if (!nrow(rr) || rr$n[1] == 0L) next
+        k <- k + 1L
+        ribbons[[k]] <- ribbon_df(lo$x[1] + W / 2, rr$x[1] - W / 2,
+                                  lo$ymin[1], lo$ymax[1],
+                                  rr$ymin[1], rr$ymax[1], k, p, "emerge")
+      }
+    }
+  }
+  ribbons <- rbindlist(ribbons)
+  col_tot <- nodes[, .(n_total = sum(n)), by = Category]
+  col_tot[, x := as.numeric(Category)]
+  miss_col <- setdiff(unique(nodes$Node), names(taxon_cols))
+  taxon_cols[miss_col] <- "#BDBDBD"
+  taxon_cols["Unassigned"] <- "#9E9E9E"
+  taxon_cols["Other"] <- "#D9D9D9"
+  ggplot() +
+    geom_ribbon(data = ribbons[type %in% c("dropout", "emerge")],
+                aes(x = x, ymin = ymin, ymax = ymax, group = id, fill = Taxon),
+                alpha = 0.18, colour = NA) +
+    geom_ribbon(data = ribbons[type == "shared"],
+                aes(x = x, ymin = ymin, ymax = ymax, group = id, fill = Taxon),
+                alpha = 0.55, colour = NA) +
+    geom_ribbon(data = ribbons[type == "other"],
+                aes(x = x, ymin = ymin, ymax = ymax, group = id),
+                fill = "#D9D9D9", alpha = 0.45, colour = NA) +
+    geom_rect(data = nodes, aes(xmin = x - W / 2, xmax = x + W / 2,
+                                ymin = ymin, ymax = ymax, fill = Node),
+              colour = NA) +
+    geom_text(data = if (node_labels) nodes[frac >= 0.02] else nodes[0],
+              aes(x = x, y = (ymin + ymax) / 2, label = Node),
+              size = 2.2, colour = "grey10") +
+    geom_text(data = col_tot, aes(x = x, y = 1.02,
+                                  label = sprintf("%s\n(n=%s)", Category,
+                                                  format(n_total, big.mark = ","))),
+              size = 2.6, lineheight = 0.95, vjust = 0) +
+    scale_fill_manual(values = taxon_cols, name = rank_col) +
+    scale_x_continuous(breaks = seq_along(cat_levels),
+                       labels = cat_levels, limits = c(0.55, 4.45),
+                       expand = c(0, 0)) +
+    scale_y_continuous(limits = c(0, 1.14), expand = c(0, 0)) +
+    coord_cartesian(clip = "off") +
+    theme_void(base_size = 8) +
+    theme(legend.position = "right",
+          legend.key.size = unit(0.28, "cm"),
+          axis.text.x = element_blank(),
+          plot.margin = margin(5, 5, 5, 5))
+}
+
+pmap16 <- fread(file.path(DATA_DIR, "manual", "phylum_color_map_16s.tsv"))
+cols16 <- setNames(pmap16$Color, pmap16$Phylum)
+```
+
+```{r fig-sankey}
+tax16 <- tax_all[["16S"]]
+taxits <- tax_all[["ITS"]]
+ph16 <- unique(c(merged_tab[kingdom == "16S", ASV_ID]))
+phy16 <- data.table(ASV_ID = ph16,
+                    Phylum = tax16$Phylum[match(ph16, tax16$taxid)])
+top_ph16 <- phy16[, .N, by = Phylum][order(-N)][1:12, Phylum]
+clsits <- data.table(ASV_ID = merged_tab[kingdom == "ITS", ASV_ID])
+clsits[, Class := taxits$Class[match(ASV_ID, taxits$taxid)]]
+clsits[is.na(Class) | Class == "", Class := "Unassigned"]
+top_cl_its <- clsits[, .N, by = Class][order(-N)][1:12, Class]
+pal_idx <- round(seq(1, length(PAL_MULTI), length.out = length(top_cl_its)))
+cols_its <- setNames(PAL_MULTI[pal_idx], top_cl_its)
+cols_its["Other"] <- "#D9D9D9"
+
+p_s16 <- sankey_plot(merged_tab[kingdom == "16S"], tax16, cols16)
+p_sits <- sankey_plot(merged_tab[kingdom == "ITS"], taxits, cols_its,
+                      rank_col = "Class", node_labels = FALSE)
+save_fig(p_s16, CHAPTER, "Fig_4_phylum_sankey", 160, 100)
+embed_fig(CHAPTER, "Fig_4_phylum_sankey")
+save_fig(p_sits, CHAPTER, "Fig_4_its_sankey", 160, 100)
+embed_fig(CHAPTER, "Fig_4_its_sankey")
+```
+
+## 9.3 Host-genus HBS volcano / 宿主属 HBS 火山图
+
+```{r fig-volcano}
+volcano_plot <- function(d) {
+  d <- copy(d)
+  d[, sig := FDR < 0.05]
+  d[, neglog10FDR := -log10(pmax(FDR, 1e-300))]
+  lab_pos <- d[sig & OR > 1][order(-neglog10FDR)][1:min(10, .N)]
+  lab_neg <- d[sig & OR < 1][order(-neglog10FDR)][1:min(5, .N)]
+  labs <- unique(rbind(lab_pos, lab_neg), by = "taxon")
+  ggplot(d, aes(x = log2OR, y = neglog10FDR)) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed",
+               colour = "grey50", linewidth = 0.3) +
+    geom_vline(xintercept = 0, colour = "grey70", linewidth = 0.3) +
+    geom_point(aes(size = total_asv_pos,
+                   colour = fifelse(!sig, "NS",
+                     fifelse(OR > 1, "Positive", "Negative"))),
+               alpha = 0.8) +
+    geom_text_repel(data = labs, aes(label = taxon), size = 2.2,
+                    max.overlaps = Inf, segment.size = 0.2,
+                    min.segment.length = 0) +
+    scale_colour_manual(values = c(Positive = COL_POS, Negative = COL_NEG,
+                                   NS = COL_NS), name = NULL) +
+    scale_size_continuous(range = c(0.4, 3.2), name = "ASVs") +
+    labs(x = "log2 OR per doubling of host breadth", y = "-log10(FDR)") +
+    theme_seed(8) +
+    theme(legend.position = "bottom",
+          legend.box = "horizontal",
+          legend.key.size = unit(0.25, "cm"),
+          legend.spacing.x = unit(0.15, "cm")) +
+    guides(colour = guide_legend(nrow = 1, order = 1),
+           size = guide_legend(nrow = 1, order = 2))
+}
+v16 <- volcano_plot(hbs_merged[["16S"]][rank == "Genus"])
+vits <- volcano_plot(hbs_merged[["ITS"]][rank == "Genus"])
+save_fig(v16, CHAPTER, "Fig_4_host_genus_volcano", 85, 90)
+embed_fig(CHAPTER, "Fig_4_host_genus_volcano")
+save_fig(vits, CHAPTER, "Fig_4_its_volcano", 50, 60)
+embed_fig(CHAPTER, "Fig_4_its_volcano")
+```
+
+## 9.4 HBS genus x pool matrix / HBS 属 × 池矩阵
+
+For each kingdom the matrix shows the top-ranked genera (16S: ten; ITS: five),
+ranked by the number of analysed pools with a significant positive
+host-breadth slope.
+
+```{r fig-matrix}
+# Merged (all-sample) HBS at genus level, shown as the leftmost column of
+# each kingdom's matrix and included when ranking the top taxa.
+merged_hbs <- rbindlist(lapply(c("16S", "ITS"), function(k) {
+  d <- hbs_merged[[k]][rank == "Genus"]
+  if (!nrow(d)) return(NULL)
+  cbind(kingdom = k, grain = "Merged", pool = sprintf("%s merged", k), d)
+}), fill = TRUE)
+
+matrix_plot <- function(k, n_top = 10L) {
+  pools <- pool_summary[kingdom == k & included == TRUE]
+  cols <- rbind(
+    data.table(pool = sprintf("%s merged", k), grain = "Merged"),
+    pools[, .(pool, grain = as.character(grain))]
+  )
+  cols[, grain := factor(grain, levels = c("Merged", "Coarse A", "Coarse B",
+                                           "Medium"))]
+  d <- rbind(hbs_bypool[kingdom == k & pool %in% pools$pool],
+             merged_hbs[kingdom == k], fill = TRUE)
+  pos <- d[, .(n_pos = sum(FDR < 0.05 & OR > 1)), by = taxon]
+  top <- pos[order(-n_pos, taxon)][1:min(n_top, .N), taxon]
+  # y-axis labels carry the number of columns (merged + pools) with a
+  # significant positive HBS association for that genus; x-axis labels
+  # carry the number of qualified host genera analysed in each pool.
+  y_labs <- setNames(
+    sprintf("%s (%d)", rev(top), pos$n_pos[match(rev(top), pos$taxon)]),
+    rev(top))
+  col_n <- c(setNames(pools$n_qualified, pools$pool),
+             setNames(gos_merged[[k]]$n_genera, sprintf("%s merged", k)))
+  x_labs <- setNames(
+    sprintf("%s (%d)", sub("^(16S|ITS) ", "", cols$pool), col_n[cols$pool]),
+    cols$pool)
+  x_labs[sprintf("%s merged", k)] <-
+    sprintf("Merged (%d)", gos_merged[[k]]$n_genera)
+  dd <- CJ(taxon = top, pool = cols$pool)
+  dd <- merge(dd, d[, .(taxon, pool, log2OR, FDR)],
+              by = c("taxon", "pool"), all.x = TRUE)
+  dd[, tested := !is.na(log2OR)]
+  # log2 OR of the host-breadth slope; untested genus x pool pairs are grey
+  dd[, fill_val := fifelse(tested, log2OR, NA_real_)]
+  dd[, star_lab := fifelse(
+    tested & !is.na(FDR) & FDR < 0.05,
+    fifelse(FDR < 0.001, "***", fifelse(FDR < 0.01, "**", "*")), "")]
+  dd[, pool := factor(pool, levels = cols$pool)]
+  dd[, grain := cols$grain[match(pool, cols$pool)]]
+  dd[, taxon := factor(taxon, levels = rev(top))]
+  ggplot(dd, aes(x = pool, y = taxon)) +
+    geom_tile(aes(fill = fill_val), colour = "white", linewidth = 0.25) +
+    geom_text(aes(label = star_lab), size = 2.3, family = "Arial",
+              colour = "black") +
+    scale_fill_gradient2(low = COL_NEG, mid = "white", high = COL_POS,
+                         midpoint = 0, limits = c(-2, 2), oob = scales::squish,
+                         na.value = "grey90", breaks = -2:2,
+                         name = "log2 OR per doubling of host breadth") +
+    facet_grid(~grain, scales = "free_x", space = "free_x") +
+    scale_x_discrete(labels = x_labs) +
+    scale_y_discrete(labels = y_labs) +
+    labs(x = NULL, y = NULL,
+         caption = "Grey tiles: genus not tested in this pool (fewer than 20 ASVs or <3 host-breadth values). * FDR < 0.05; ** FDR < 0.01; *** FDR < 0.001") +
+    theme_seed(8) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1, size = 6.5),
+          axis.text.y = element_text(size = 6.8),
+          strip.text = element_text(size = 7),
+          panel.grid = element_blank(),
+          axis.ticks = element_blank(),
+          legend.position = "bottom",
+          legend.title = element_text(size = 7),
+          plot.caption = element_text(size = 5.8, hjust = 0),
+          plot.caption.position = "plot")
+}
+save_fig(matrix_plot("16S"), CHAPTER, "Fig_4_genera_pool_matrix", 90, 80)
+embed_fig(CHAPTER, "Fig_4_genera_pool_matrix")
+save_fig(matrix_plot("ITS", n_top = 5L), CHAPTER, "Fig_4_its_genera_matrix",
+         150, 120)
+embed_fig(CHAPTER, "Fig_4_its_genera_matrix")
+```
+
+## 9.5 Taxonomic-level HBS forest / 分类阶元 HBS 森林图
+
+16S uses phylum, order and genus; ITS uses class, order and genus. The 16S
+forest keeps phylum + order and genus as two panels. The ITS forest is rotated
+90 degrees counterclockwise, so the three ranks form side-by-side columns
+(class, order, genus) with the log2 odds ratio on the vertical axis.
+
+```{r fig-forest}
+forest_plot <- function(d, ranks = c("Phylum", "Order", "Genus")) {
+  sig <- copy(d[FDR < 0.05 & rank %in% ranks])
+  if (!nrow(sig)) return(NULL)
+  sig[, rank := factor(rank, levels = ranks)]
+  # keep at most 40 genus-level taxa (strongest effects) to stay readable
+  if (nrow(sig[rank == "Genus"]) > 40L) {
+    keep <- sig[rank == "Genus"][order(-abs(log2OR))][1:40, taxon]
+    sig <- sig[rank != "Genus" | taxon %in% keep]
+  }
+  setorder(sig, rank, OR)
+  sig[, direction := factor(direction, levels = c("Decreasing", "Increasing"))]
+  sig[, y_id := factor(paste(rank, taxon, sep = "::"),
+                       levels = rev(paste(rank, taxon, sep = "::")))]
+  y_labs <- setNames(paste0(sig$taxon, " ", sig$star), as.character(sig$y_id))
+  # Point and interval share one scale: the point is the logistic coefficient
+  # b (log OR per doubling), and OR_lo/OR_hi = exp(b -/+ 1.96 SE), so their
+  # natural logs are the Wald limits on that same scale; the half-width is
+  # centred on b so the interval always straddles the point.
+  # 点与区间同尺度：点为 logistic 系数 b（每翻倍 log OR），OR_lo/OR_hi =
+  # exp(b ∓ 1.96 SE)，其自然对数即同一尺度上的 Wald 上下限，回填半宽到 b 两侧。
+  sig[, `:=`(ci_lo = log2OR - (log(OR_hi) - log(OR_lo)) / 2,
+             ci_hi = log2OR + (log(OR_hi) - log(OR_lo)) / 2)]
+  x_rng <- range(c(sig$log2OR, sig$ci_lo, sig$ci_hi), na.rm = TRUE)
+  x_brk <- pretty(x_rng, n = 5)
+  x_lims <- range(c(x_rng, x_brk)) + c(-0.2, 0.2)
+  p <- ggplot(sig, aes(log2OR, y_id, colour = direction)) +
+    geom_vline(xintercept = 0, linetype = 2, colour = "grey45",
+               linewidth = 0.3) +
+    geom_pointrange(aes(xmin = ci_lo, xmax = ci_hi), size = 0.18,
+                    linewidth = 0.3) +
+    scale_x_continuous(limits = x_lims, breaks = x_brk) +
+    scale_y_discrete(labels = y_labs) +
+    scale_colour_manual(values = c(Decreasing = COL_NEG,
+                                   Increasing = COL_POS), name = NULL) +
+    labs(x = "log2 OR per doubling of host breadth", y = NULL) +
+    theme_seed(8) +
+    theme(axis.text.y = element_text(size = 5.2),
+          axis.title.x = element_text(size = 7),
+          strip.text = element_text(size = 7),
+          panel.spacing = unit(0.15, "lines"),
+          legend.position = "bottom")
+  # rank strips above each panel (including the single-rank Genus panel)
+  p <- p + facet_wrap(~ rank, ncol = 1, scales = "free_y", space = "free_y",
+                      strip.position = "top")
+  p
+}
+# Rotated layout for ITS: taxa along the x-axis and OR on the vertical axis,
+# so the three ranks appear as side-by-side columns (Class | Order | Genus).
+forest_plot_h <- function(d, ranks = c("Class", "Order", "Genus")) {
+  sig <- copy(d[FDR < 0.05 & rank %in% ranks])
+  if (!nrow(sig)) return(NULL)
+  sig[, rank := factor(rank, levels = ranks)]
+  if (nrow(sig[rank == "Genus"]) > 40L) {
+    keep <- sig[rank == "Genus"][order(-abs(log2OR))][1:40, taxon]
+    sig <- sig[rank != "Genus" | taxon %in% keep]
+  }
+  setorder(sig, rank, OR)
+  sig[, direction := factor(direction, levels = c("Decreasing", "Increasing"))]
+  sig[, x_id := factor(paste(rank, taxon, sep = "::"),
+                       levels = paste(rank, taxon, sep = "::"))]
+  x_labs <- setNames(paste0(sig$taxon, " ", sig$star), as.character(sig$x_id))
+  # Point and interval share one scale: the point is the logistic coefficient
+  # b (log OR per doubling), and OR_lo/OR_hi = exp(b -/+ 1.96 SE), so their
+  # natural logs are the Wald limits on that same scale; the half-width is
+  # centred on b so the interval always straddles the point.
+  # 点与区间同尺度：点为 logistic 系数 b（每翻倍 log OR），OR_lo/OR_hi =
+  # exp(b ∓ 1.96 SE)，其自然对数即同一尺度上的 Wald 上下限，回填半宽到 b 两侧。
+  sig[, `:=`(ci_lo = log2OR - (log(OR_hi) - log(OR_lo)) / 2,
+             ci_hi = log2OR + (log(OR_hi) - log(OR_lo)) / 2)]
+  y_rng <- range(c(sig$log2OR, sig$ci_lo, sig$ci_hi), na.rm = TRUE)
+  y_brk <- pretty(y_rng, n = 5)
+  y_lims <- range(c(y_rng, y_brk)) + c(-0.2, 0.2)
+  ggplot(sig, aes(x_id, log2OR, colour = direction)) +
+    geom_hline(yintercept = 0, linetype = 2, colour = "grey45",
+               linewidth = 0.3) +
+    geom_pointrange(aes(ymin = ci_lo, ymax = ci_hi), size = 0.18,
+                    linewidth = 0.3) +
+    scale_y_continuous(limits = y_lims, breaks = y_brk) +
+    scale_x_discrete(labels = x_labs) +
+    scale_colour_manual(values = c(Decreasing = COL_NEG,
+                                   Increasing = COL_POS), name = NULL) +
+    facet_grid(~rank, scales = "free_x") +
+    labs(x = NULL, y = "log2 OR per doubling of host breadth") +
+    theme_seed(8) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5,
+                                     size = 5.8),
+          strip.text = element_text(size = 7),
+          panel.spacing = unit(0.4, "lines"),
+          legend.position = "top")
+}
+
+# 16S: two-column layout, Phylum + Order on the left and Genus on the right
+f16_l <- forest_plot(hbs_merged[["16S"]], c("Phylum", "Order"))
+f16_r <- forest_plot(hbs_merged[["16S"]], "Genus")
+fits <- forest_plot_h(hbs_merged[["ITS"]], HBS_RANKS[["ITS"]])
+f16 <- if (!is.null(f16_l) && !is.null(f16_r)) {
+  (f16_l + f16_r + plot_layout(widths = c(1, 1.15), guides = "collect")) &
+    theme(legend.position = "top")
+} else NULL
+if (!is.null(f16)) save_fig(f16, CHAPTER, "Fig_4_taxon_forest_16s", 150, 120)
+if (!is.null(f16)) embed_fig(CHAPTER, "Fig_4_taxon_forest_16s")
+if (!is.null(fits)) save_fig(fits, CHAPTER, "Fig_4_its_taxon_forest", 150, 100)
+if (!is.null(fits)) embed_fig(CHAPTER, "Fig_4_its_taxon_forest")
+```
+
+## 9.6 Genus composition of recurrent generalists (Sankey) / 复发性通才属组成
+
+Recurrent generalists are shown as a two-panel Sankey diagram (bacteria on the
+left, fungi on the right). ASVs annotated as generalists in at least five of
+the seven qualified pools are retained, separating the 7-, 6- and 5-pool strata
+(the ">5" rule is applied as >= 5 so that the 5-pool stratum described below is
+represented). In each panel the left column shows the size and proportion of
+each stratum; the right column shows the fifteen genera contributing the most
+ASVs among these recurrent generalists, with the remaining genera pooled as
+"Other". Ribbons connect each stratum to the genera of its ASVs. For ITS,
+unassigned genus labels are kept as "Unassigned".
+
+```{r fig-recurrent-sankey}
+recur_sankey <- function(k, panel_title) {
+  d <- gen_counts[kingdom == k & n_generalist_pools >= 5L,
+                  .(ASV_ID, Count = n_generalist_pools, Genus)]
+  d[is.na(Genus) | Genus == "", Genus := "Unassigned"]
+  ord <- d[, .(N = .N, top_count = max(Count)), by = Genus][
+    order(-N, -top_count, Genus)]
+  keep <- head(ord$Genus, 15L)
+  d[, Genus := fifelse(Genus %in% keep, Genus, "Other")]
+
+  left_lev <- sort(unique(d$Count), decreasing = TRUE)
+  right_lev <- c(ord[Genus %in% keep, Genus], "Other")
+  d[, Count := factor(Count, levels = left_lev)]
+  d[, Genus := factor(Genus, levels = right_lev)]
+
+  n_tot <- nrow(d)
+  W <- 0.13; xl <- 1; xr <- 2
+  stack_nodes <- function(dt, key, lev) {
+    nd <- dt[, .N, by = key]
+    setnames(nd, key, "Node")
+    nd[, Node := factor(Node, levels = lev)]
+    setorder(nd, Node)
+    nd[, frac := N / n_tot]
+    nd[, `:=`(ytop = 1 - (cumsum(frac) - frac), ybot = 1 - cumsum(frac))]
+    nd
+  }
+  L <- stack_nodes(d, "Count", left_lev)
+  R <- stack_nodes(d, "Genus", right_lev)
+
+  seg <- d[, .N, by = .(Count, Genus)]
+  seg[, frac := N / n_tot]
+  segL <- seg[order(Count, Genus)]
+  segL[, `:=`(yl_top = L$ytop[match(Count, L$Node)] -
+                       (cumsum(frac) - frac),
+              yl_bot = L$ytop[match(Count, L$Node)] - cumsum(frac)),
+       by = Count]
+  segR <- seg[order(Genus, Count)]
+  segR[, `:=`(yr_top = R$ytop[match(Genus, R$Node)] -
+                       (cumsum(frac) - frac),
+              yr_bot = R$ytop[match(Genus, R$Node)] - cumsum(frac)),
+       by = Genus]
+  flows <- merge(segL[, .(Count, Genus, yl_top, yl_bot)],
+                 segR[, .(Count, Genus, yr_top, yr_bot)],
+                 by = c("Count", "Genus"))
+
+  ribbons <- rbindlist(lapply(seq_len(nrow(flows)), function(i) {
+    tt <- seq(0, 1, length.out = 60)
+    ss <- tt * tt * (3 - 2 * tt)
+    data.table(
+      x = (xl + W / 2) + ((xr - W / 2) - (xl + W / 2)) * tt,
+      ymin = flows$yl_bot[i] + (flows$yr_bot[i] - flows$yl_bot[i]) * ss,
+      ymax = flows$yl_top[i] + (flows$yr_top[i] - flows$yl_top[i]) * ss,
+      id = i, Count = flows$Count[i])
+  }))
+
+  count_cols <- setNames(
+    c("7" = "#1D3557", "6" = "#457B9D", "5" = "#A8DADC")[
+      as.character(left_lev)], as.character(left_lev))
+  gen_cols <- setNames(PAL_QUAL[seq_along(right_lev)], right_lev)
+  gen_cols["Other"] <- "#D9D9D9"
+  gen_cols["Unassigned"] <- "#4D4D4D"
+
+  labL <- L[, .(x = xl - W / 2 - 0.03, y = (ytop + ybot) / 2,
+                lab = sprintf("%s pools\nn=%d (%.1f%%)",
+                              as.character(Node), N, 100 * frac))]
+  labR <- R[, .(x = xr + W / 2 + 0.03, y = (ytop + ybot) / 2,
+                lab = sprintf("%s (%d)", as.character(Node), N))]
+  head_lab <- data.table(
+    x = c(xl, xr), y = 1.05,
+    lab = c(sprintf("Generalist pools\nn=%d ASVs", n_tot),
+            "Top 15 genera"))
+
+  p <- ggplot() +
+    geom_ribbon(data = ribbons, aes(x = x, ymin = ymin, ymax = ymax,
+                                    group = id, fill = Count),
+                alpha = 0.45, colour = NA) +
+    geom_rect(data = L, aes(xmin = xl - W / 2, xmax = xl + W / 2,
+                            ymin = ybot, ymax = ytop, fill = Node),
+              colour = NA) +
+    scale_fill_manual(values = count_cols, guide = "none") +
+    ggnewscale::new_scale_fill() +
+    geom_rect(data = R, aes(xmin = xr - W / 2, xmax = xr + W / 2,
+                            ymin = ybot, ymax = ytop, fill = Node),
+              colour = NA) +
+    scale_fill_manual(values = gen_cols, guide = "none") +
+    geom_text_repel(data = labL, aes(x = x, y = y, label = lab),
+                    hjust = 1, size = 2.2, direction = "y",
+                    nudge_x = -0.06, min.segment.length = 0,
+                    segment.size = 0.2, segment.colour = "grey55",
+                    box.padding = 0.12, max.overlaps = Inf, colour = "grey10") +
+    geom_text_repel(data = labR, aes(x = x, y = y, label = lab),
+                    hjust = 0, size = 2.2, direction = "y", nudge_x = 0.06,
+                    min.segment.length = 0, segment.size = 0.2,
+                    segment.colour = "grey55", box.padding = 0.12,
+                    max.overlaps = Inf) +
+    geom_text(data = head_lab, aes(x = x, y = y, label = lab), size = 2.6,
+              fontface = "bold", lineheight = 0.95, vjust = 0) +
+    scale_x_continuous(limits = c(0.45, 3.0), expand = c(0, 0)) +
+    scale_y_continuous(limits = c(0, 1.12), expand = c(0, 0),
+                       oob = scales::squish) +
+    coord_cartesian(clip = "off") +
+    theme_void(base_size = 8) +
+    theme(plot.margin = margin(6, 6, 6, 6),
+          plot.title = element_text(size = 8, face = "bold", hjust = 0.5)) +
+    labs(title = panel_title)
+
+  write_int(d[, .(kingdom = k, ASV_ID,
+                  n_generalist_pools = as.integer(as.character(Count)),
+                  Genus = as.character(Genus))],
+            CHAPTER, paste0("recurrent_generalist_asv_", tolower(k)))
+  p
+}
+p_sankey_16s <- recur_sankey("16S", "Bacteria (16S)")
+p_sankey_its <- recur_sankey("ITS", "Fungi (ITS)")
+p_sankey <- p_sankey_16s + p_sankey_its + plot_layout(ncol = 2)
+save_fig(p_sankey, CHAPTER, "Fig_4_generalist_sankey", 240, 120)
+embed_fig(CHAPTER, "Fig_4_generalist_sankey")
+```
+
+## 9.7 Abundance–host-breadth curves / 丰度–宿主广度曲线
+
+Following the previous analysis pipeline, each ASV contributes one point: `x`
+is its host breadth and `y` is the log10 of its mean relative abundance across
+the samples in which that ASV is detected (per-sample relative abundance, i.e.
+CSS divided by the sample total over mapped ASVs; samples without mapped reads
+are dropped). Restricting the mean to detected samples avoids penalising
+low-breadth ASVs. Each scatter is accompanied by a linear fit, its 95%
+confidence band and a one-sided Spearman test for a positive association.
+Bacteria (16S) and fungi (ITS) are shown side by side, each pooling all ASVs
+with host breadth ≥ 1; colour encodes abundance, point size scales with
+log2(host breadth) + 1, and a horizontal jitter separates ASVs that share an
+integer host breadth. Both panels share the colour scale, the y-axis range and
+the legend.
+
+```{r abund-helpers}
+suppressMessages(library(gridExtra))
+
+abund_subplot <- function(dt, stat_row, color_limits, y_limits,
+                          legend = "none", metric_size = 2.2) {
+  dt <- copy(dt)
+  n_asv <- stat_row$n_asv; n_pts <- nrow(dt); mean_h <- stat_row$mean_h
+  p_pos <- tryCatch(suppressWarnings(stats::cor.test(
+    dt$host_breadth, dt$log10_rel, method = "spearman",
+    alternative = "greater")$p.value), error = function(e) NA_real_)
+  xr <- range(dt$host_breadth); y_lo <- y_limits[1]
+  has_fit <- n_pts >= 3L && uniqueN(dt$host_breadth) >= 2L
+  fit_lab <- character(0); band <- NULL
+  if (has_fit) {
+    fit <- tryCatch(stats::lm(log10_rel ~ host_breadth, data = dt),
+                    error = function(e) NULL)
+    if (!is.null(fit)) {
+      cf <- stats::coef(fit); r2 <- summary(fit)$r.squared
+      eq <- sprintf("y = %sx %s %.3f",
+                    formatC(cf[2], digits = 3, format = "g"),
+                    ifelse(cf[1] < 0, "-", "+"), abs(cf[1]))
+      fit_lab <- c(eq, sprintf("R² = %.3f", r2))
+      xseq <- seq(min(dt$host_breadth), max(dt$host_breadth), length.out = 200)
+      pr <- stats::predict(fit, newdata = data.frame(host_breadth = xseq),
+                           se.fit = TRUE)
+      crit <- stats::qt(0.975, df = fit$df.residual)
+      band <- data.frame(x = xseq, yfit = pr$fit,
+                         lo = pr$fit - crit * pr$se.fit,
+                         hi = pr$fit + crit * pr$se.fit)
+      band$lo <- pmax(band$lo, y_lo); band$hi <- pmin(band$hi, 0)
+      band$yfit <- pmin(pmax(band$yfit, y_lo), 0)
+    }
+  }
+  p_star <- if (is.na(p_pos)) "NA" else if (p_pos < 0.001) "***" else
+    if (p_pos < 0.01) "**" else if (p_pos < 0.05) "*" else "ns"
+  metric_lab <- paste(c(sprintf("ASVs: %d", n_asv),
+    sprintf("mean host breadth: %.2f", mean_h), sprintf("P_pos: %s", p_star),
+    fit_lab), collapse = "\n")
+  abund_cols <- c("#93BCD0", "#93BCD0", "#FCB366", "#FE816F", "#FE816F")
+  abund_vals <- c(0, 0.35, 0.5, 0.65, 1)
+  p <- ggplot(dt, aes(x = host_breadth, y = log10_rel, colour = log10_rel,
+                      size = log2(host_breadth) + 1)) +
+    # jitter only separates ASVs with the same integer host breadth; the fit
+    # and its band use the unjittered x
+    geom_point(alpha = 0.3,
+               position = position_jitter(width = 0.45, height = 0, seed = 1)) +
+    scale_colour_gradientn(colours = abund_cols, values = abund_vals,
+      limits = color_limits, breaks = pretty(color_limits, n = 4),
+      name = "log10\nrel. abund.") +
+    scale_size_continuous(range = c(0.2, 1.4), breaks = 1:6,
+                          name = "log2(HB) + 1")
+  if (!is.null(band)) {
+    p <- p +
+      geom_ribbon(data = band, inherit.aes = FALSE,
+                  aes(x = x, ymin = lo, ymax = hi), fill = "grey60",
+                  alpha = 0.35) +
+      geom_line(data = band, inherit.aes = FALSE, aes(x = x, y = yfit),
+                colour = "black", linewidth = 0.35) +
+      geom_line(data = band, inherit.aes = FALSE, aes(x = x, y = lo),
+                colour = "grey30", linewidth = 0.2, linetype = "dashed") +
+      geom_line(data = band, inherit.aes = FALSE, aes(x = x, y = hi),
+                colour = "grey30", linewidth = 0.2, linetype = "dashed")
+  }
+  p + scale_x_continuous(expand = expansion(mult = c(0.02, 0.02))) +
+    scale_y_continuous(limits = y_limits, expand = expansion(mult = c(0.06, 0))) +
+    annotate("label", x = xr[2], y = y_lo, label = metric_lab,
+             size = metric_size, hjust = 1, vjust = 0,
+             fill = grDevices::rgb(1, 1, 1, 0.85), linewidth = 0.2,
+             label.padding = unit(0.3, "lines")) +
+    labs(x = NULL, y = NULL) +
+    theme_seed(8) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey92", linewidth = 0.2),
+          axis.text = element_text(size = 8, colour = "black"),
+          axis.ticks = element_line(colour = "black", linewidth = 0.3),
+          axis.title = element_text(size = 8.5, colour = "black"),
+          legend.position = legend,
+          legend.box = if (legend == "bottom") "horizontal" else "vertical",
+          legend.key.height = unit(0.32, "cm"),
+          legend.key.width = unit(0.35, "cm"),
+          legend.title = element_text(size = 7.5),
+          legend.text = element_text(size = 7))
+}
+
+abund_banner <- function(p, grp_name, banner_h = 0.28, scatter_h = 2.4,
+                         banner_size = 3.2) {
+  banner <- ggplot(data.frame(x = 0, y = 0, lab = grp_name),
+                   aes(x = x, y = y, label = lab)) +
+    geom_text(fontface = "bold", size = banner_size) +
+    theme_void() +
+    theme(plot.background = element_rect(fill = "grey90", colour = "grey35",
+                                         linewidth = 0.3),
+          plot.margin = margin(0.5, 0.5, 0.5, 0.5))
+  arrangeGrob(banner, ggplotGrob(p), ncol = 1, heights = c(banner_h, scatter_h))
+}
+
+abund_legend <- function(p) {
+  gt <- ggplotGrob(p)
+  idx <- which(grepl("^guide-box", gt$layout$name))
+  idx <- idx[vapply(idx, function(k) {
+    g <- gt$grobs[[k]]; !is.null(g) && !inherits(g, "zeroGrob")
+  }, logical(1))]
+  if (!length(idx)) return(NULL)
+  gs <- lapply(idx, function(k) gt$grobs[[k]])
+  if (length(gs) == 1L) gs[[1L]] else arrangeGrob(grobs = gs, nrow = 1L)
+}
+```
+
+```{r abund-asvmean-data}
+abund_asvmean <- function(k) {
+  f <- file.path(rds_dir(CHAPTER), sprintf("abund_asvmean_%s.rds", tolower(k)))
+  if (file.exists(f) && !FORCE) return(readRDS(f))
+  css <- data.table::fread(css_merged_path(CSS_FILE[[k]]), sep = "\t")
+  asv_all <- as.character(css[[1L]])
+  keep <- asv_all %in% pres[[k]]$asv
+  asv <- asv_all[keep]
+  sample_cols <- pres[[k]]$samples
+  m <- as.matrix(css[keep, sample_cols, with = FALSE])
+  rm(css); invisible(gc())
+  cs <- colSums(m)
+  ok_cs <- cs > 0
+  mm <- m[, ok_cs, drop = FALSE]
+  cs2 <- cs[ok_cs]
+  # average each ASV over the samples where it is detected (CSS > 0), so
+  # rarely detected ASVs are not diluted by absences
+  n_det <- rowSums(mm > 0)
+  sum_rel <- as.numeric(mm %*% (1 / cs2))
+  rel_mean <- sum_rel / n_det
+  rm(m, mm); invisible(gc())
+  d <- data.table::data.table(ASV_ID = asv, mean_rel = rel_mean,
+                              n_detected = n_det,
+                              log10_rel = log10(rel_mean))
+  d <- merge(d, merged_tab[kingdom == k,
+                           .(ASV_ID, host_breadth, category)], by = "ASV_ID")
+  d <- d[host_breadth >= 1L]
+  gc_col <- if (k == "16S") "Phylum" else "Class"
+  d[, grp := tax_all[[k]][[gc_col]][match(ASV_ID, tax_all[[k]]$taxid)]]
+  d[is.na(grp) | grp == "", grp := "Unassigned"]
+  saveRDS(d, f)
+  d
+}
+abund_asv <- list(`16S` = abund_asvmean("16S"), ITS = abund_asvmean("ITS"))
+progress(sprintf("merged abundance curves: %d 16S ASVs, %d ITS ASVs",
+                 nrow(abund_asv[["16S"]]), nrow(abund_asv$ITS)))
+```
+
+```{r fig-abundance-curves-all-asv}
+# kingdom-level view: every ASV with host breadth >= 1, no taxonomic split
+all16 <- abund_asv[["16S"]]
+allits <- abund_asv$ITS
+stat_all <- function(d) list(n_asv = nrow(d), mean_h = mean(d$host_breadth))
+color_limits_a <- c(min(all16$log10_rel, allits$log10_rel), 0)
+y_limits_a <- c(min(all16$log10_rel, allits$log10_rel, -0.5), 0)
+panel_all16 <- abund_banner(abund_subplot(all16, stat_all(all16),
+  color_limits_a, y_limits_a, legend = "none"), "Bacteria (16S)")
+panel_allits <- abund_banner(abund_subplot(allits, stat_all(allits),
+  color_limits_a, y_limits_a, legend = "none"), "Fungi (ITS)")
+p_leg_a <- abund_subplot(all16, stat_all(all16), color_limits_a, y_limits_a,
+  legend = "bottom")
+legend_grob_a <- abund_legend(p_leg_a)
+ytitle_a <- textGrob("log10(mean relative abundance)", rot = 90,
+                     gp = gpar(fontsize = 9))
+xtitle_a <- textGrob("Host breadth (no. of host genera)",
+                     gp = gpar(fontsize = 9))
+full_a <- arrangeGrob(
+  ytitle_a, panel_all16, panel_allits, xtitle_a, legend_grob_a,
+  layout_matrix = rbind(c(1, 2, 3), c(NA, 4, 4), c(NA, 5, 5)),
+  widths = c(0.62, 3.3, 3.3),
+  heights = c(2.4, 0.40, 0.45))
+save_fig(full_a, CHAPTER, "Fig_4_abundance_curves_all_asv", 185, 100)
+embed_fig(CHAPTER, "Fig_4_abundance_curves_all_asv")
+```
+
+## 9.8 Host breadth on the microbial tree / 微生物树上的宿主广度
+
+```{r fig-tree, fig.width=7.1, fig.height=6.7}
+suppressMessages({
+  library(ggtree)
+  library(ggtreeExtra)
+  library(ggnewscale)
+})
+tr <- ape::read.tree(tree_file)
+ann_tree <- data.table(taxid = pres$`16S`$asv,
+                       host_breadth = gos_merged[["16S"]]$nr$host_breadth,
+                       category = gos_merged[["16S"]]$classes)
+ann_tree <- ann_tree[match(tr$tip.label, taxid)]
+stopifnot(!anyNA(ann_tree$taxid), all(ann_tree$host_breadth >= 1))
+ann_tree[, host_breadth_cap := pmin(host_breadth, 20)]
+ann_tree[, cat4 := factor(fifelse(category == "generalist", "Generalist",
+                    fifelse(category == "intermediate", "Intermediate",
+                      fifelse(category == "specialist", "Specialist", "NRH"))),
+                    levels = c("Generalist", "Intermediate", "Specialist",
+                               "NRH"))]
+ann_df <- as.data.frame(ann_tree)
+p_tree <- ggtree(tr, layout = "circular", size = 0.02, colour = "grey75")
+# inner ring: generalist / intermediate / specialist / NRH
+p_tree <- p_tree +
+  geom_fruit(data = ann_df, geom = geom_tile,
+             mapping = aes(y = taxid, fill = cat4),
+             width = 0.05, offset = 0.01) +
+  scale_fill_manual(
+    values = c(Generalist = "#E67E22", Intermediate = "#F4A261",
+               Specialist = "#547FB6", NRH = "#E5E5E5"),
+    guide = guide_legend(order = 1, title = "Category")) +
+  ggnewscale::new_scale_fill() +
+  # outer ring: continuous host breadth (host_breadth), capped at 20 for colour
+  geom_fruit(data = ann_df, geom = geom_tile,
+             mapping = aes(y = taxid, fill = host_breadth_cap),
+             width = 0.05, offset = 0.07) +
+  scale_fill_gradientn(
+    colours = c("#DDF2C8", "#C6E3AE", "#ADD565", "#78A495", "#3A5A40",
+                "#1D3557"),
+    values = scales::rescale(c(1, 2, 4, 8, 14, 20)),
+    limits = c(1, 20), oob = scales::squish, name = "Host breadth",
+    guide = guide_colourbar(order = 2, barheight = unit(1.5, "cm"),
+                            barwidth = unit(0.25, "cm"))) +
+  theme(legend.position = "right",
+        legend.text = element_text(size = 6.5),
+        legend.title = element_text(size = 7),
+        legend.key.height = unit(0.28, "cm"))
+stat_lab <- character(0)
+if (nrow(phy_stats)) {
+  lam <- phy_stats[method == "Pagel_lambda"][1]
+  kk <- phy_stats[method == "Blomberg_K"][1]
+  stat_lab <- c(stat_lab,
+    sprintf("lambda = %.3f (P %s)", lam$estimate,
+            ifelse(lam$P < 0.001, "< 0.001", sprintf("= %.3f", lam$P))),
+    sprintf("K = %.2e (P = %.3f)", kk$estimate, kk$P))
+}
+if (nrow(d_stats)) {
+  dd <- d_stats[1]
+  stat_lab <- c(stat_lab,
+    sprintf("D = %.3f (P(D=1) = %.3f)", dd$D, dd$P_random))
+}
+p_tree <- p_tree +
+  labs(caption = paste(stat_lab, collapse = "; ")) +
+  theme(plot.caption = element_text(size = 6, hjust = 0))
+save_fig(p_tree, CHAPTER, "Fig_4_microbial_tree_host_breadth", 180, 170)
+embed_fig(CHAPTER, "Fig_4_microbial_tree_host_breadth")
+```
+
+# 10. Output log / 输出记录
+
+```{r log}
+write_log(CHAPTER, "ch4_summary", c(
+  sprintf("Chapter 4 generated %s", Sys.time()),
+  sprintf("16S merged: %d samples, %d genera; threshold %d; generalist %d; O/E %.2f",
+          gos_merged[["16S"]]$n_samples, gos_merged[["16S"]]$n_genera,
+          gos_merged[["16S"]]$th$threshold,
+          sum(gos_merged[["16S"]]$classes == "generalist"),
+          gos_merged[["16S"]]$oe),
+  sprintf("ITS merged: %d samples, %d genera; threshold %d; generalist %d; O/E %.2f",
+          gos_merged[["ITS"]]$n_samples, gos_merged[["ITS"]]$n_genera,
+          gos_merged[["ITS"]]$th$threshold,
+          sum(gos_merged[["ITS"]]$classes == "generalist"),
+          gos_merged[["ITS"]]$oe),
+  sprintf("Qualified pools: %d", length(gos_pools)),
+  sprintf("HBS merged significant positive: 16S %d; ITS %d",
+          sum(hbs_merged[["16S"]][rank == "Genus"]$FDR < 0.05 &
+                hbs_merged[["16S"]][rank == "Genus"]$OR > 1),
+          sum(hbs_merged[["ITS"]][rank == "Genus"]$FDR < 0.05 &
+                hbs_merged[["ITS"]][rank == "Genus"]$OR > 1))
+))
+cat("Chapter 4 finished\n")
+```

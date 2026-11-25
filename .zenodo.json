@@ -1,8 +1,8 @@
 {
   "title": "Host-associated community structure and microbial host breadth in the seed microbiome: analysis code",
   "upload_type": "software",
-  "version": "1.0.0",
-  "description": "Downstream analysis code for a cross-study synthesis of 5,962 marker-gene profiles from 169 plant species and 45 countries. The 16S reference-mapped set includes bacteria and archaea. Companion processed-input, precomputed-result and output archives are released separately. The workflow starts from processed tables and reuses archived computations; it does not reproduce raw-read processing or the historical modified iCAMP engine. Final manuscript artwork includes editorial changes beyond source plots.",
+  "version": "2.0.0",
+  "description": "Downstream analysis code for the revised global seed microbiome meta-analysis of 6,349 marker-gene samples (4,012 16S and 2,337 ITS) from 122 host genera across 45 countries. The workflow starts from processed tables and uses archived computations and figure assets supplied with the companion dataset. The code and data support reconstruction of the analysis outputs, including host identity and phylogeny, microbial host breadth, and associations with predicted traits and gene functions.",
   "creators": [
     {
       "name": "Wang, Zilong",
@@ -49,7 +49,7 @@
       "scheme": "url"
     },
     {
-      "identifier": "10.5281/zenodo.24241936",
+      "identifier": "10.5281/zenodo.24523342",
       "relation": "requires",
       "scheme": "doi"
     }

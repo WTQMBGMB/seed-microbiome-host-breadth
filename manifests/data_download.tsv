@@ -1,0 +1,2 @@
+archive	url	sha256	notes
+seed-microbiome-inputs-v2.0.0.tar.gz	https://zenodo.org/api/records/24523342/files/seed-microbiome-inputs-v2.0.0.tar.gz/content	705b3aa6b76a92225dc9dc6fc4658f722eee3f222a53cc5f3171165b13780151	Extracts data/ and server_result/ into the repository root

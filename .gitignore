@@ -1,17 +1,25 @@
-# Data are versioned in the associated Zenodo deposit.
-data/**
+# Input data are archived externally / 原始数据通过外链归档
+data/*
 !data/README.md
-server_result/**
-!server_result/README.md
-results/
+!data/MANIFEST.tsv
+
+# Generated intermediates and render artefacts / 生成的中间文件与渲染产物
+result/html/
+result/prepared/
+result/rds/
+result/intermediate/
+result/logs/
+result/v2/
+
+# Local R state / 本地 R 状态
 .Rhistory
 .RData
-.Rproj.user/
+Rplots.pdf
+*.tmp-*
+
+# Downloaded server results and generated outputs
+server_result/*
+!server_result/README.md
+!server_result/MANIFEST.tsv
+result/
 __pycache__/
-*.pyc
-.DS_Store
-Thumbs.db
-.env
-*token*
-.local_state/
-manuscript_tables/

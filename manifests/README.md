@@ -1,9 +1,15 @@
-# Release manifests
+# Manifests / 清单
 
-- release_files.tsv: 537 processed inputs/results, relative paths, byte sizes and SHA-256.
-- input_manifest.tsv / server_result_manifest.tsv: inventories shipped inside data archives.
-- figure_map.tsv: 84 output mappings, including the original 83 mappings and Table S7.
+| File | Content |
+|---|---|
+| `data_download.tsv` | Archive URL, SHA256 and extraction note for `data/` and `server_result/` |
+| `output_manifest.tsv` | Every expected figure and table, with kind and reference size |
+| `../data/MANIFEST.tsv` | Input files: role (raw/prepared/precomputed), size, SHA256, source |
+| `../server_result/MANIFEST.tsv` | Server results: source, size, SHA256, generating step/parameters |
 
-Run `python scripts/tools/verify_assets.py` after extracting the companion data archives.
-The historical workstation staging scripts are in `scripts/local_maintenance/` and are
-not necessary to use the release. Downloaded archives must match `release-assets.json`.
+`output_manifest.tsv` is used by `scripts/tools/check_outputs.py`. To compare a
+new run against a reference, pass the reference result directory to
+`scripts/tools/compare_results.py`.
+
+`output_manifest.tsv` 供输出检查脚本使用；数值比对使用
+`scripts/tools/compare_results.py --ref <reference> --new result`。

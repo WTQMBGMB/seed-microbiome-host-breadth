@@ -1,18 +1,39 @@
-# Optional server-style recomputation / 可选服务器等价重算
+# Server-equivalent computations / 服务器等价计算
 
-默认流程不运行本目录。所有高耗时结果已放在 `server_result/`，`Analysis_pipeline.Rmd` 只读取并校验。
+The default pipeline never runs these steps. It reads the archived outputs in
+`server_result/`; missing files stop the run with a message pointing here.
+Only set `SEED_ALLOW_SERVER_RECOMPUTE=true` if you intend to recompute locally.
 
-需要本地重算时：
+默认流程不运行本目录脚本，只读取 `server_result/` 中的现成结果；文件缺失时
+流程停止并提示本目录。只有显式设置 `SEED_ALLOW_SERVER_RECOMPUTE=true` 才本地重算。
 
-1. 设置 `ALLOW_SERVER_RECOMPUTE=true`。
-2. 设置 `SEED_RECOMPUTE` 为具体步骤（如 `adonis_v4`、`gos`），或 `all`。
-3. 保证线程不超过 16（`SEED_THREADS=16`）。
+All scripts use `<SERVER_BASE>` as a placeholder for the working directory; edit
+it or export `BASE_DIR` before running. Paths to Rscript/MAFFT/trimAl/FastTree
+are intentionally not hard-coded.
 
-当前本地可重算的步骤在对应章节内实现：
+所有脚本以 `<SERVER_BASE>` 作为工作目录占位符；运行前修改或导出 `BASE_DIR`。
+Rscript、MAFFT、trimAl、FastTree 的路径未硬编码。
 
-- β 距离 / adonis2：`analysis/02_alpha_beta.Rmd`
-- GOS 零模型：`analysis/04_generalists_specialists.Rmd`
-- bNTI：默认只读 `server_result/bnti/local` 的 pair 表；历史 iCAMP 引擎未归档，不提供等价重算。
-- 全 ASV 树：默认复用 `server_result/gos/tree_16s_allASV`；建树命令见 `server_result/README.md` 和原项目归档。
+## Contents / 内容
 
-本目录不包含自动安装或自动下载逻辑。
+| Step | Script | Output consumed by |
+|---|---|---|
+| Ch2 mixed-pool adonis, 1999 permutations | `ch2_mixed_pool_adonis.R <work_dir> 1999 <ncore>` | `server_result/ch2/mixed_pool_adonis.rds` |
+| Ch2 per-region Bray distances | `ch2_beta_distances.R` (optional; see note) | `server_result/ch2/beta/bray_dist_*.rds` |
+| Ch2 Part A/B adonis objects | same Ch2 code as the Rmd (`params$force_recompute`) | `server_result/ch2/adonis/part{A_units,B_pools}.rds` |
+| Ch3 ASV tree + mapped-bin backend | `asv_host_phylo/server_build_candidate_trees.sh`, then `00`–`20` scripts | `server_result/ch3/` |
+| Ch4 GOS tree (MAFFT→trimAl→FastTreeMP→midpoint) | `ch4/run_ch4_server.sh` | `server_result/ch4/gos_hostn_pos_16s_midpoint.nwk` |
+| Ch4 λ/K and Fritz–Purvis D | `ch4/run_ch4_server.sh` | `server_result/ch4/Tab_4_tree_*.tsv` |
+
+## Notes / 说明
+
+- Ch2 β distances and Part A/B adonis objects were produced by the same code as
+  `Ch2_host_effect.Rmd` on the server. If the archived objects are absent, the
+  chapter recomputes them locally when `params$force_recompute = TRUE`; this is
+  the supported fallback. / Ch2 的 β 距离与 Part A/B adonis 对象由同一章代码在服务器
+  生成；缺失时可在章内重算。
+- Ch3 ASV backend scripts were written for a fixed server layout; they are kept
+  for provenance and optional rebuilding. / Ch3 后端脚本保留用于溯源与可选重建。
+- Ch4 tree construction requires MAFFT, trimAl and FastTreeMP; the R statistics
+  require `phylosig_fast.R`, `phylo_d_fast.R` and the helper scripts in `ch4/`.
+  / Ch4 建树需要 MAFFT、trimAl、FastTreeMP；统计需要 `ch4/` 中的 R 脚本。

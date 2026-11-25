@@ -1,0 +1,813 @@
+---
+title: "Chapter 1 - Seed microbiome dataset"
+output:
+  html_document:
+    toc: false
+    self_contained: false
+params:
+  rebuild_mapping_fraction: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = TRUE, warning = TRUE,
+  fig.show = "hide", comment = "#>"
+)
+source(file.path(normalizePath(getwd(), winslash = "/"), "R", "config.R"))
+source(file.path(PROJECT_ROOT, "R", "common.R"))
+suppressMessages({
+  library(data.table)
+  library(ggplot2)
+  library(dplyr)
+  library(patchwork)
+})
+ensure_v2_dirs()
+CHAPTER <- "ch1_dataset"
+```
+
+# 1. Read and normalise metadata / 读取并规范化元数据
+
+```{r read-metadata}
+md_16s <- read_meta("16S")
+md_its <- read_meta("ITS")
+md <- rbindlist(list(md_16s, md_its), fill = TRUE)
+
+md[, Region  := factor(Region, levels = REG_LEVELS)]
+md[, dataset := factor(dataset, levels = c("16S", "ITS"))]
+md[, kingdom := factor(kingdom, levels = c("Bacteria", "Fungi"))]
+md[, src_group := factor(
+  data.table::fcase(Cite == "S58", SRC_LEVELS[2],
+                    Cite == "S59", SRC_LEVELS[3],
+                    default      = SRC_LEVELS[1]),
+  levels = SRC_LEVELS)]
+
+stopifnot(nrow(md_16s) == 4012L, nrow(md_its) == 2337L)
+cat(sprintf("16S: %d samples | ITS: %d samples | combined: %d\n",
+            nrow(md_16s), nrow(md_its), nrow(md)))
+
+cat("\nPlatform normalisation:\n")
+print(md[, .N, by = .(Platform, PlatformN)][order(-N)])
+
+cat("\nCountry normalisation (changed values):\n")
+print(unique(md[Country != CountryRaw, .(CountryRaw, Country)]))
+```
+
+```{r shared-metadata}
+# Cleaned metadata shared by all chapters
+write_int(md_16s, CHAPTER, "metadata_16S_clean", shared = TRUE)
+write_int(md_its, CHAPTER, "metadata_ITS_clean", shared = TRUE)
+
+# Platform mapping provenance
+plat_map <- md[, .(n_samples = .N), by = .(Platform, PlatformN)][order(PlatformN, -n_samples)]
+write_int(plat_map, CHAPTER, "platform_normalization", shared = TRUE)
+
+# Country mapping provenance
+ctry_map <- md[, .(n_samples = .N),
+               by = .(original_country = CountryRaw, mapped_country = Country)][
+                 order(-n_samples)]
+write_int(ctry_map, CHAPTER, "country_normalization", shared = TRUE)
+
+save_rds(md, CHAPTER, "metadata_combined")
+```
+
+# 2. Dataset overview table / 数据集总览表
+
+```{r tab-overview}
+stats_row <- function(d, ds_label, region_label) {
+  g <- d[!is.na(Genus) & Genus != "", .N, by = Genus]
+  q <- if (nrow(g)) g[N >= 3, .N] else 0L
+  data.table(
+    dataset                = ds_label,
+    region                 = region_label,
+    samples                = nrow(d),
+    sources                = uniqueN(d$source),
+    papers                 = uniqueN(d$Cite),
+    countries              = n_distinct_nonmissing(d$Country),
+    host_genera            = uniqueN(d$Genus[!is.na(d$Genus) & d$Genus != ""]),
+    host_species           = uniqueN(d$species[!is.na(d$species) & d$species != ""]),
+    qualified_host_genera  = q,
+    seed                   = sum(d$extract == "Seed", na.rm = TRUE),
+    germinating            = sum(d$extract == "Germinating", na.rm = TRUE),
+    SD                     = sum(d$IF_SD == "SD", na.rm = TRUE),
+    NSD                    = sum(d$IF_SD == "NSD", na.rm = TRUE)
+  )
+}
+
+tab1 <- rbindlist(list(
+  stats_row(md[dataset == "16S"], "16S", "All"),
+  stats_row(md[dataset == "16S" & Region == "V3_V4"], "16S", "V3_V4"),
+  stats_row(md[dataset == "16S" & Region == "V4"],    "16S", "V4"),
+  stats_row(md[dataset == "16S" & Region == "V5_V6"], "16S", "V5_V6"),
+  stats_row(md[dataset == "16S" & Region == "V5_V7"], "16S", "V5_V7"),
+  stats_row(md[dataset == "ITS"], "ITS", "All"),
+  stats_row(md[dataset == "ITS" & Region == "ITS1"], "ITS", "ITS1"),
+  stats_row(md[dataset == "ITS" & Region == "ITS2"], "ITS", "ITS2"),
+  stats_row(md, "Combined", "All")
+))
+write_tab(tab1, CHAPTER, "Tab_1_dataset_overview")
+tab1
+```
+
+# 3. Design: extract × sterilization / 组织 × 消毒设计
+
+```{r tab-design}
+make_design <- function(d, ds_label) {
+  grid <- CJ(extract = c("Seed", "Germinating"),
+             IF_SD   = c("SD", "NSD"))
+  s <- d[, .(samples = .N, sources = uniqueN(source), papers = uniqueN(Cite)),
+         by = .(extract, IF_SD)]
+  out <- s[grid, on = .(extract, IF_SD)]
+  out[is.na(samples), `:=`(samples = 0L, sources = 0L, papers = 0L)]
+  out[, dataset := ds_label]
+  setcolorder(out, c("dataset", "extract", "IF_SD", "samples", "sources", "papers"))
+  out[]
+}
+
+tab_design <- rbindlist(list(
+  make_design(md[dataset == "16S"], "16S"),
+  make_design(md[dataset == "ITS"], "ITS"),
+  make_design(md, "Combined")
+))
+tab_design[, dataset := factor(dataset, levels = c("16S", "ITS", "Combined"))]
+setorder(tab_design, dataset, extract, IF_SD)
+write_tab(tab_design, CHAPTER, "Tab_1_design_counts")
+write_int(tab_design, CHAPTER, "extract_sterilization_counts")
+tab_design
+```
+
+# 4. Platform counts (table only) / 测序平台计数（仅表）
+
+```{r tab-platform}
+pl <- md[, .(samples = .N), by = .(dataset, Region, PlatformN)]
+pl_all <- md[, .(Region = "All", samples = .N), by = .(dataset, PlatformN)]
+pl <- rbindlist(list(pl, pl_all), fill = TRUE)
+pl[, Region := factor(Region, levels = c("All", REG_LEVELS))]
+pl[, dataset := factor(dataset, levels = c("16S", "ITS"))]
+setorder(pl, dataset, Region, -samples)
+write_tab(pl, CHAPTER, "Tab_1_platform_counts")
+write_int(pl, CHAPTER, "platform_counts")
+pl
+```
+
+# 5. Country × region matrix / 国家 × 区段矩阵
+
+```{r tab-country-region}
+cr <- dcast(md, Country ~ Region, value.var = "SampleID",
+            fun.aggregate = length, fill = 0)
+for (r in setdiff(REG_LEVELS, names(cr))) cr[, (r) := 0L]
+cr[, n_16S := rowSums(.SD), .SDcols = c("V3_V4", "V4", "V5_V6", "V5_V7")]
+cr[, n_ITS := rowSums(.SD), .SDcols = c("ITS1", "ITS2")]
+cr[, total := n_16S + n_ITS]
+cr <- cr[order(-total)]
+cr[, is_unknown := Country == "Unknown"]
+cr <- rbindlist(list(cr[is_unknown == FALSE], cr[is_unknown == TRUE]), use.names = TRUE)
+cr[, is_unknown := NULL]
+
+tot <- cr[, lapply(.SD, sum),
+          .SDcols = c(REG_LEVELS, "n_16S", "n_ITS", "total")]
+tot[, Country := "TOTAL"]
+cr <- rbindlist(list(cr, tot), use.names = TRUE, fill = TRUE)
+setcolorder(cr, c("Country", REG_LEVELS, "n_16S", "n_ITS", "total"))
+write_tab(cr, CHAPTER, "Tab_1_country_by_region")
+cr
+```
+
+# 6. Source registry / 研究来源登记
+
+```{r tab-source-registry}
+src <- md[, .(
+  Cite           = paste(sort(unique(Cite)), collapse = ";"),
+  kingdoms       = paste(sort(unique(as.character(kingdom))), collapse = ";"),
+  n_samples      = .N,
+  n_16S          = sum(dataset == "16S"),
+  n_ITS          = sum(dataset == "ITS"),
+  n_countries    = n_distinct_nonmissing(Country),
+  regions_16S    = paste(intersect(REG_LEVELS, unique(Region[dataset == "16S"])), collapse = ","),
+  regions_ITS    = paste(intersect(REG_LEVELS, unique(Region[dataset == "ITS"])), collapse = ","),
+  platforms      = paste(sort(unique(PlatformN)), collapse = ";"),
+  seed_n         = sum(extract == "Seed"),
+  germinating_n  = sum(extract == "Germinating"),
+  SD_n           = sum(IF_SD == "SD"),
+  NSD_n          = sum(IF_SD == "NSD"),
+  n_host_genera  = uniqueN(Genus[!is.na(Genus) & Genus != ""])
+), by = source]
+
+# host genera with >=3 samples within this source (both kingdoms combined)
+qg <- md[!is.na(Genus) & Genus != "", .N, by = .(source, Genus)][
+  N >= 3, .(n_qualified_host_genera = .N), by = source]
+src[qg, n_qualified_host_genera := i.n_qualified_host_genera, on = "source"]
+src[is.na(n_qualified_host_genera), n_qualified_host_genera := 0L]
+
+# Part A candidate: >=2 host genera with >=3 samples, kingdoms pooled within source
+qgs <- md[!is.na(Genus) & Genus != "", .N, by = .(source, Genus)][
+  N >= 3, .(n_qualified = .N), by = source][n_qualified >= 2]
+src[qgs, partA_candidate := TRUE, on = "source"]
+src[is.na(partA_candidate), partA_candidate := FALSE]
+
+# Analysis-feasible units: >=2 qualified host genera within one kingdom
+qgd <- md[!is.na(Genus) & Genus != "", .N,
+          by = .(source, dataset, Genus)][N >= 3, .(n_qual = .N),
+          by = .(source, dataset)][n_qual >= 2]
+pa16 <- qgd[dataset == "16S", .(partA_16S = TRUE), by = source]
+pait <- qgd[dataset == "ITS", .(partA_ITS = TRUE), by = source]
+src[pa16, partA_16S := i.partA_16S, on = "source"]
+src[pait, partA_ITS := i.partA_ITS, on = "source"]
+src[is.na(partA_16S), partA_16S := FALSE]
+src[is.na(partA_ITS), partA_ITS := FALSE]
+
+# Part B pool membership: host genus x region with >=5 sources
+pool_src <- unique(md[!is.na(Genus) & Genus != "",
+                      .(dataset, Region, Genus, source)])
+pool_ok <- pool_src[, .(n_sources = uniqueN(source)),
+                    by = .(dataset, Region, Genus)][n_sources >= 5]
+pool_ok[, pool := paste(dataset, as.character(Region), Genus, sep = "|")]
+ps <- pool_src[pool_ok[, .(dataset, Region, Genus, pool)],
+               on = .(dataset, Region, Genus), nomatch = 0]
+pools_by_source <- ps[, .(partB_pools = paste(sort(pool), collapse = ";")), by = source]
+src[pools_by_source, partB_pools := i.partB_pools, on = "source"]
+src[is.na(partB_pools), partB_pools := ""]
+
+# Coarse pool cells (dataset x extract x sterilization)
+cells <- md[, .(coarse_cells = paste(sort(unique(paste(dataset, extract, IF_SD, sep = "/"))),
+                                     collapse = ";")), by = source]
+src[cells, coarse_cells := i.coarse_cells, on = "source"]
+
+setorder(src, -n_samples)
+setcolorder(src, c("source", "Cite", "kingdoms", "n_samples", "n_16S", "n_ITS",
+                   "n_countries", "regions_16S", "regions_ITS", "platforms",
+                   "seed_n", "germinating_n", "SD_n", "NSD_n",
+                   "n_host_genera", "n_qualified_host_genera",
+                   "partA_candidate", "partA_16S", "partA_ITS",
+                   "partB_pools", "coarse_cells"))
+write_tab(src, CHAPTER, "Tab_1_source_registry")
+
+cat("sources:", nrow(src), " partA candidate:", sum(src$partA_candidate),
+    " analysis units 16S:", sum(src$partA_16S),
+    " ITS:", sum(src$partA_ITS), "\n")
+cat("Part B pools:", nrow(pool_ok), "\n")
+print(pool_ok[, .(dataset, Region, Genus, n_sources)][order(dataset, Region, Genus)])
+head(src, 8)
+```
+
+# 7. Intermediates for figures / 作图中间表
+
+```{r intermediates}
+# sample-level registry
+reg_cols <- c(META_COLS, "dataset", "kingdom", "PlatformN", "src_group")
+write_int(md[, ..reg_cols], CHAPTER, "sample_registry")
+
+# source group x region (both kingdoms combined)
+sr <- md[, .(samples = .N), by = .(src_group, Region, kingdom)]
+setorder(sr, src_group, Region)
+write_int(sr, CHAPTER, "source_group_region_counts")
+
+# host genus x kingdom
+hg <- md[!is.na(Genus) & Genus != "", .(samples = .N), by = .(Genus, dataset, kingdom)]
+write_int(hg, CHAPTER, "host_genus_kingdom_counts")
+
+# country counts (map input)
+cc <- md[Country != "Unknown",
+         .(n_16S = sum(dataset == "16S"), n_ITS = sum(dataset == "ITS")),
+         by = Country][, total := n_16S + n_ITS][order(-total)]
+write_int(cc, CHAPTER, "country_counts")
+
+# extract x sterilization x region (design heatmaps)
+dz <- md[, .(samples = .N, species = uniqueN(species)),
+         by = .(Region, extract, IF_SD)]
+write_int(dz, CHAPTER, "extract_sterilization_region_counts")
+
+ls_int <- c("sample_registry", "source_group_region_counts",
+            "host_genus_kingdom_counts", "country_counts",
+            "extract_sterilization_region_counts", "reference_mapping_fraction")
+cat("intermediates written:", paste(ls_int, collapse = ", "), "\n")
+```
+
+# 8. Reads mapped to reference sequences / 参考序列比对比例
+
+```{r mapping-fraction}
+# mapped = ASV ID in Merged_{16S_Silva,ITS_Unite}_filtered.fa
+# unmapped = ASV ID in Merged_{16S,ITS}_Unmapped_filtered.fa
+mapping_fraction <- function(ds) {
+  dir <- file.path(DATA_DIR, "filtered_merge", ds)
+  ref_fa <- file.path(dir, if (ds == "16S") "Merged_16S_Silva_filtered.fa"
+                           else "Merged_ITS_Unite_filtered.fa")
+  unm_fa <- file.path(dir, sprintf("Merged_%s_Unmapped_filtered.fa", ds))
+  fa_ids <- function(f) {
+    h <- readLines(f, warn = FALSE)
+    x <- sub("^>", "", h[startsWith(h, ">")])
+    sub("\\s.*$", "", x)
+  }
+  ref_ids <- fa_ids(ref_fa)
+  unm_ids <- fa_ids(unm_fa)
+  cat(sprintf("  [%s] reference ASVs %d; unmapped ASVs %d; overlap %d\n",
+              ds, length(ref_ids), length(unm_ids),
+              length(intersect(ref_ids, unm_ids))))
+
+  tab <- fread(file.path(dir, sprintf("Merged_%s_table_filtered.txt", ds)),
+               sep = "\t", colClasses = list(character = 1))
+  setnames(tab, 1, "ASV_ID")
+  stopifnot(all(tab$ASV_ID %in% c(ref_ids, unm_ids)))
+
+  m <- as.matrix(tab[, -1, with = FALSE])
+  tot <- colSums(m)
+  msum <- colSums(m[tab$ASV_ID %in% ref_ids, , drop = FALSE])
+  rm(m); invisible(gc())
+
+  meta_ids <- md[dataset == ds, SampleID]
+  cat(sprintf("  [%s] table samples %d; not in metadata %d; metadata without table %d\n",
+              ds, ncol(tab) - 1, length(setdiff(names(tot), meta_ids)),
+              length(setdiff(meta_ids, names(tot)))))
+
+  data.table(SampleID = names(tot), dataset = ds,
+             total_reads = tot, mapped_reads = msum,
+             mapped_pct = 100 * msum / tot)
+}
+
+mf_path <- file.path(int_dir(CHAPTER), "reference_mapping_fraction.tsv")
+if (!isTRUE(params$rebuild_mapping_fraction) && file.exists(mf_path)) {
+  cat("reuse existing intermediate:", mf_path, "\n")
+  mf <- fread(mf_path, sep = "\t")
+} else {
+  mf <- rbindlist(list(mapping_fraction("16S"), mapping_fraction("ITS")))
+  write_int(mf, CHAPTER, "reference_mapping_fraction")
+}
+cat(sprintf("median reference-mapped reads: 16S %.1f%%, ITS %.1f%%\n",
+            median(mf[dataset == "16S"]$mapped_pct),
+            median(mf[dataset == "ITS"]$mapped_pct)))
+```
+
+# 9. Figure: samples by study set, split by region / 样本量图
+
+```{r fig-samples-by-source}
+d <- read_int(CHAPTER, "source_group_region_counts")
+d[, Region    := factor(Region, levels = REG_LEVELS)]
+d[, src_group := factor(src_group, levels = SRC_LEVELS)]
+d[, seglab := fifelse(samples >= 100, as.character(samples), "")]
+tot <- d[, .(samples = sum(samples)), by = src_group]
+
+p <- ggplot(d, aes(src_group, samples, fill = Region)) +
+  geom_col(width = 0.62, colour = "white", linewidth = 0.2) +
+  geom_text(aes(label = seglab), position = position_stack(vjust = 0.5),
+            size = 2.2, colour = "black") +
+  geom_text(data = tot, aes(src_group, samples, label = samples),
+            inherit.aes = FALSE, vjust = -0.45, size = 2.5) +
+  scale_fill_manual(values = REG_COL, name = "Region") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.10))) +
+  labs(x = NULL, y = "Number of samples") +
+  theme_seed() +
+  theme(panel.grid.major.x = element_blank(),
+        axis.text.x = element_text(angle = 30, hjust = 1))
+save_fig(p, CHAPTER, "Fig_1_samples_by_source", 100, 100)
+embed_fig(CHAPTER, "Fig_1_samples_by_source")
+p
+```
+
+# 10. Figure: extract x sterilization design by region / 设计图
+
+```{r fig-design}
+d <- read_int(CHAPTER, "extract_sterilization_region_counts")
+grid <- CJ(Region = REG_LEVELS, extract = c("Seed", "Germinating"),
+           IF_SD = c("SD", "NSD"))
+d <- d[grid, on = .(Region, extract, IF_SD)]
+d[is.na(samples), `:=`(samples = 0L, species = 0L)]
+d[, combo := factor(paste(extract, IF_SD, sep = " x "),
+                    levels = c("Seed x SD", "Seed x NSD",
+                               "Germinating x SD", "Germinating x NSD"))]
+d[, Region := factor(Region, levels = REG_LEVELS)]
+
+heat_design <- function(var, low, high) {
+  vmax <- max(d[[var]])
+  ggplot(d, aes(Region, combo, fill = .data[[var]])) +
+    geom_tile(colour = "white", linewidth = 0.6) +
+    geom_text(aes(label = .data[[var]],
+                  colour = .data[[var]] > 0.55 * vmax),
+              size = 2.4, show.legend = FALSE) +
+    scale_fill_gradient(low = low, high = high, limits = c(0, vmax),
+                        guide = "none") +
+    scale_colour_manual(values = c(`FALSE` = "black", `TRUE` = "white")) +
+    scale_y_discrete(limits = rev(levels(d$combo))) +
+    labs(x = NULL, y = NULL) +
+    theme_seed() +
+    theme(panel.grid = element_blank(),
+          axis.text.x = element_text(angle = 55, hjust = 1))
+}
+
+p1 <- heat_design("samples", "#F4F1EA", "#3A5A40")
+p2 <- heat_design("species", "#FBF0E6", "#B4521F")
+p  <- p1 + p2
+save_fig(p, CHAPTER, "Fig_1_extract_sterilization_design", 150, 75)
+embed_fig(CHAPTER, "Fig_1_extract_sterilization_design")
+p
+```
+
+# 11. Figure: world map of samples / 世界地图
+
+```{r fig-world-map}
+suppressMessages(library(sf))
+
+cc <- read_int(CHAPTER, "country_counts")
+shp <- st_read(file.path(DATA_DIR, "gis", "ne_110m_admin_0_countries",
+                         "ne_110m_admin_0_countries.shp"), quiet = TRUE)
+shp <- shp[shp$NAME != "Antarctica", c("NAME", "geometry")]
+
+map <- left_join(shp, cc, by = c("NAME" = "Country"))
+map$total[is.na(map$total)] <- 0
+cat("metadata countries matched to Natural Earth:",
+    sum(cc$Country %in% shp$NAME), "/", nrow(cc), "\n")
+cat("unmatched:", paste(setdiff(cc$Country, shp$NAME), collapse = ", "), "\n")
+
+top8 <- cc[order(-total)][1:8]
+map_top <- map[map$NAME %in% top8$Country, ]
+lab_pts <- st_point_on_surface(st_geometry(map_top))
+lab_df <- data.frame(
+  NAME  = map_top$NAME,
+  total = map_top$total,
+  X     = st_coordinates(lab_pts)[, 1],
+  Y     = st_coordinates(lab_pts)[, 2]
+)
+offs <- data.frame(
+  NAME = c("France", "Australia", "China", "United States of America",
+           "South Korea", "Austria", "Spain", "Colombia"),
+  dx   = c(-18, -18, 12, -18, 10, 10, -14, -14),
+  dy   = c(8, -6, -12, 7, -18, 10, -12, -8),
+  hj   = c(1, 1, 0, 1, 0, 0, 1, 1),
+  stringsAsFactors = FALSE
+)
+stopifnot(all(lab_df$NAME %in% offs$NAME))
+lab_df <- merge(lab_df, offs, by = "NAME", sort = FALSE)
+lab_df$lab_x <- lab_df$X + lab_df$dx
+lab_df$lab_y <- lab_df$Y + lab_df$dy
+lab_df$label <- paste0(lab_df$NAME, " (", lab_df$total, ")")
+
+p <- ggplot(map) +
+  geom_sf(aes(fill = total), colour = "white", linewidth = 0.12) +
+  geom_segment(data = lab_df, aes(x = X, y = Y, xend = lab_x, yend = lab_y),
+               inherit.aes = FALSE, linewidth = 0.18, colour = "grey35") +
+  geom_text(data = lab_df[lab_df$hj == 1, ],
+            aes(x = lab_x, y = lab_y, label = label),
+            inherit.aes = FALSE, hjust = 1, vjust = 0.5, size = 2.1) +
+  geom_text(data = lab_df[lab_df$hj == 0, ],
+            aes(x = lab_x, y = lab_y, label = label),
+            inherit.aes = FALSE, hjust = 0, vjust = 0.5, size = 2.1) +
+  scale_fill_gradientn(
+    colours = c("#EEEEEE", "#C5D8E7", "#81B29A", "#3A5A40"),
+    trans = "log1p",
+    breaks = c(1, 10, 100, 1000),
+    labels = c("1", "10", "100", "1000"),
+    name = "Samples",
+    na.value = "grey92"
+  ) +
+  coord_sf(crs = "+proj=robin", default_crs = st_crs(4326), expand = FALSE) +
+  labs(x = NULL, y = NULL) +
+  theme_seed() +
+  theme(panel.grid = element_line(colour = "grey92", linewidth = 0.2),
+        axis.text = element_blank(), axis.ticks = element_blank(),
+        legend.position = c(0.01, 0.01),
+        legend.justification = c(0, 0),
+        legend.direction = "horizontal",
+        legend.title.position = "top",
+        legend.background = element_rect(fill = "white", colour = NA),
+        legend.key.height = grid::unit(3, "mm"),
+        legend.key.width  = grid::unit(4, "mm"),
+        legend.margin = margin(1, 1, 1, 1, "mm"))
+save_fig(p, CHAPTER, "Fig_1_world_map", 160, 85)
+embed_fig(CHAPTER, "Fig_1_world_map")
+p
+```
+
+# 12. Figure: top 10 host genera, samples split by kingdom / 宿主属 Top10
+
+```{r fig-host-top10}
+hg <- read_int(CHAPTER, "host_genus_kingdom_counts")
+hg[, kingdom := factor(kingdom, levels = c("Bacteria", "Fungi"))]
+
+tot10 <- hg[, .(samples = sum(samples)), by = Genus][order(-samples)][1:10]
+lev   <- rev(tot10$Genus)          # bottom -> top, largest genus on top
+tot10[, Genus := factor(Genus, levels = lev)]
+d <- hg[Genus %in% as.character(tot10$Genus)]
+d[, Genus := factor(Genus, levels = lev)]
+
+p <- ggplot(d, aes(samples, Genus, fill = kingdom)) +
+  geom_col(width = 0.72, colour = "white", linewidth = 0.15) +
+  geom_text(data = tot10, aes(x = samples, y = Genus, label = samples),
+            inherit.aes = FALSE, hjust = -0.15, size = 2.5) +
+  scale_fill_manual(values = KING_COL, name = NULL) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.10))) +
+  labs(x = "Number of samples", y = NULL) +
+  theme_seed() +
+  theme(panel.grid.major.y = element_blank(),
+        legend.position = c(0.80, 0.12),
+        legend.background = element_rect(fill = "white", colour = NA),
+        legend.key.size = grid::unit(3.2, "mm"))
+save_fig(p, CHAPTER, "Fig_1_host_genus_top10", 90, 90)
+embed_fig(CHAPTER, "Fig_1_host_genus_top10")
+p
+```
+
+# 13. Figure: reads mapped to reference sequences / 比对比例图
+
+```{r fig-mapping-fraction}
+mf <- read_int(CHAPTER, "reference_mapping_fraction")
+mf[, kingdom := factor(fifelse(dataset == "16S", "Bacteria", "Fungi"),
+                       levels = c("Bacteria", "Fungi"))]
+med <- mf[, .(med = round(median(mapped_pct), 1)), by = kingdom]
+
+p <- ggplot(mf, aes(mapped_pct, fill = kingdom)) +
+  geom_histogram(breaks = seq(0, 100, 2.5), colour = "white",
+                 linewidth = 0.15, show.legend = FALSE) +
+  geom_vline(data = med, aes(xintercept = med),
+             linetype = "dashed", linewidth = 0.3) +
+  geom_text(data = med, aes(x = med - 2, y = Inf, label = paste0("median ", med, "%")),
+            inherit.aes = FALSE, hjust = 1, vjust = 1.5, size = 2.3) +
+  facet_wrap(~kingdom, nrow = 1, scales = "free_y") +
+  scale_fill_manual(values = KING_COL) +
+  scale_x_continuous(breaks = seq(0, 100, 20), limits = c(0, 100),
+                     expand = expansion(mult = c(0.01, 0.01))) +
+  labs(x = "Reads mapped to reference (%)", y = "Number of samples") +
+  theme_seed() +
+  theme(strip.background = element_rect(fill = "white", colour = NA))
+save_fig(p, CHAPTER, "Fig_1_reference_mapping_fraction", 160, 80)
+embed_fig(CHAPTER, "Fig_1_reference_mapping_fraction")
+p
+```
+
+# 14. Host genus tree with iTOL annotation / 宿主属树与 iTOL 注释
+
+```{r host-genus-tree}
+suppressMessages({
+  library(ape)
+  library(ggtree)
+  library(ggtreeExtra)
+  library(itol.toolkit)
+})
+
+tree_species <- read.tree(host_tree_path("plant_species_tree_all.nwk"))
+
+# one randomly chosen species per host genus (fixed seed for reproducibility).
+# Genera with fewer than 3 samples (16S + ITS combined) are pruned from the tree.
+# Only species whose name belongs to the genus are eligible; "Rorripa" is a
+# spelling variant of Rorippa. Leucospermum has species Scabiosa_lucida in the
+# metadata (family conflict) and therefore has no valid representative.
+spp <- unique(md[!is.na(Genus) & Genus != "", .(Genus, species)])
+spp[, sp_genus := sub("_.*$", "", species)]
+spp[sp_genus == "Rorripa", sp_genus := "Rorippa"]
+spp <- spp[sp_genus == Genus]
+
+genus_n      <- md[!is.na(Genus) & Genus != "", .(n_samples = .N), by = Genus]
+few_samples  <- genus_n[n_samples < 3, Genus]
+
+set.seed(20261119)
+pick <- spp[, .SD[sample.int(.N, 1)], by = Genus]
+pick <- pick[Genus %in% genus_n[n_samples >= 3, Genus]]
+
+excluded <- data.table(
+  Genus = setdiff(unique(md$Genus[!is.na(md$Genus) & md$Genus != ""]),
+                  pick$Genus)
+)
+excluded[, reason := data.table::fcase(
+  Genus %in% few_samples,
+  "fewer than 3 samples",
+  default = "no species name belonging to this genus (metadata conflict)"
+)]
+
+genus_tree <- keep.tip(tree_species, pick$species)
+stopifnot(Ntip(genus_tree) == nrow(pick))
+
+# map each tree tip (species) to its genus, in tree-tip order
+sp2gen    <- setNames(pick$Genus, pick$species)
+tip_genus <- unname(sp2gen[genus_tree$tip.label])
+stopifnot(!anyNA(tip_genus), !anyDuplicated(tip_genus))
+
+tip <- md[!is.na(Genus) & Genus != "", .(
+  Order     = Order[1],
+  Family    = Family[1],
+  Class     = Class[1],
+  n_sources = uniqueN(source),
+  n_samples = .N
+), by = Genus]
+tip <- tip[match(tip_genus, Genus)]
+stopifnot(!anyNA(tip$Genus))
+tip[, representative_species := pick$species[match(Genus, pick$Genus)]]
+genus_tree$tip.label <- paste0(tip$Genus, "_", tip$n_sources)
+stopifnot(!anyDuplicated(genus_tree$tip.label))
+stopifnot(all(sub("_[0-9]+$", "", genus_tree$tip.label) == tip$Genus))
+
+# ---- tree file + iTOL annotation files ----
+td  <- tree_dir(CHAPTER)
+nwk <- file.path(td, "host_genus_tree.nwk")
+write.tree(genus_tree, nwk)
+
+# genus order is read back from the tree file; Orders follow the first
+# appearance of each Order along that tip sequence
+written    <- read.tree(nwk)
+gen_order  <- sub("_[0-9]+$", "", written$tip.label)
+stopifnot(identical(gen_order, tip$Genus))
+ord_lev    <- unique(tip$Order)
+ORD_COL    <- setNames(pal_multi(length(ord_lev)), ord_lev)
+
+# export the Order -> colour mapping in tree-tip (phylogenetic) order
+ord_col_tab <- data.table(Order = ord_lev,
+                          colour = unname(ORD_COL),
+                          rank = seq_along(ord_lev))
+fwrite(ord_col_tab, file.path(td, "host_order_colors.tsv"),
+       sep = "\t", quote = FALSE)
+write_tab(ord_col_tab, CHAPTER, "Tab_1_host_order_colors")
+
+fwrite(tip[order(Genus), .(Genus, representative_species, Order,
+                           Family, Class, n_sources, n_samples)],
+       file.path(td, "host_genus_tree_tips.tsv"), sep = "\t", quote = FALSE)
+
+fwrite(excluded[order(reason, Genus)],
+       file.path(td, "excluded_genera.tsv"), sep = "\t", quote = FALSE)
+
+df_order <- data.frame(id = genus_tree$tip.label,
+                       Order = tip$Order,
+                       colour = unname(ORD_COL[tip$Order]),
+                       stringsAsFactors = FALSE)
+df_bar   <- data.frame(id = genus_tree$tip.label,
+                       log2_samples = log2(tip$n_samples),
+                       stringsAsFactors = FALSE)
+hub <- create_hub(tree = nwk)
+
+unit_Host_order <- create_unit(data = df_order,
+                          key = "Host_order",
+                          type = "DATASET_COLORSTRIP",
+                          tree = nwk)
+unit_Host_order@common_themes$legend$horizontal = NULL  # vertical legend / 图例竖排
+hub <- hub + unit_Host_order
+unit_samples <- create_unit(data = df_bar,
+                            key = "log2_samples",
+                            type = "DATASET_SIMPLEBAR",
+                            tree = nwk)
+unit_samples@profile$color = "#1A6C92"
+unit_samples@specific_themes$basic_plot$width = 250
+unit_samples@specific_themes$basic_plot$dataset_scale = c(1,3,5,7,9)
+hub <- hub + unit_samples
+write_hub(hub, td)
+
+# align annotations with the figure palette
+order_file <- file.path(td, "Host_order.txt")
+order_txt  <- readLines(order_file)
+order_txt  <- sub("^COLOR_BRANCHES\t.*$", "COLOR_BRANCHES\t0", order_txt)
+order_txt  <- sub("^LEGEND_HORIZONTAL\t.*$", "LEGEND_HORIZONTAL\t0", order_txt)
+writeLines(order_txt, order_file)
+bar_file <- file.path(td, "log2_samples.txt")
+bar_txt  <- readLines(bar_file)
+bar_txt  <- sub("^COLOR\t.*$", "COLOR\t#8C6D31", bar_txt)
+bar_txt  <- bar_txt[!grepl("^LEGEND_(SHAPES|COLORS|LABELS)\t", bar_txt)]
+bar_txt  <- sub("^LEGEND_TITLE\t.*$", "LEGEND_TITLE\tlog2(samples)", bar_txt)
+writeLines(bar_txt, bar_file)
+
+writeLines(c(
+  "Host genus tree (Chapter 1)",
+  "- host_genus_tree.nwk: species tree pruned to one randomly chosen species",
+  "  per host genus (set.seed(20261119)); tip labels = Genus_n_sources.",
+  "- Genera with fewer than 3 samples (16S + ITS combined) are pruned.",
+  "- Host_order.txt: iTOL DATASET_COLORSTRIP, colour ring by host Order.",
+  "- host_order_colors.tsv: Order -> colour mapping in phylogenetic order.",
+  "- log2_samples.txt: iTOL DATASET_SIMPLEBAR, log2(number of samples).",
+  "- host_genus_tree_tips.tsv: representative species, Order/Family and counts.",
+  "- excluded_genera.tsv: genera excluded because they have fewer than 3",
+  "  samples, or because no species name belongs to the genus.",
+  "  Leucospermum is coded with species Scabiosa_lucida (Proteaceae vs",
+  "  Caprifoliaceae conflict), so it cannot be placed reliably."
+), file.path(td, "README.txt"))
+
+cat(sprintf("genus tree: %d tips, %d orders; excluded %d genera (<3 samples: %d; no valid species: %d)\n",
+            Ntip(genus_tree), length(ord_lev), nrow(excluded),
+            excluded[reason == "fewer than 3 samples", .N],
+            excluded[reason != "fewer than 3 samples", .N]))
+
+# ---- ggtree display figure (circular) ----
+p0 <- ggtree(genus_tree, layout = "circular",
+             linewidth = 0.22, colour = "grey25")
+pd <- p0$data
+mx <- max(pd$x)
+tip_xy <- pd[pd$isTip, ]
+tip_xy$flip  <- tip_xy$angle > 90 & tip_xy$angle < 270
+tip_xy$ang   <- ifelse(tip_xy$flip, tip_xy$angle + 180, tip_xy$angle)
+tip_xy$lx    <- tip_xy$x + 0.01 * mx
+tip_xy$hj    <- ifelse(tip_xy$flip, 1, 0)
+tip_xy$order  <- df_order$Order[match(tip_xy$label, df_order$id)]
+tip_xy$log2n <- df_bar$log2_samples[match(tip_xy$label, df_bar$id)]
+
+r_ring <- c(1.34 * mx, 1.40 * mx)
+r_bar0 <- 1.45 * mx
+bar_scale <- 0.20 * mx / max(tip_xy$log2n)
+
+p <- p0 +
+  geom_rect(data = tip_xy, inherit.aes = FALSE,
+            aes(xmin = r_ring[1], xmax = r_ring[2],
+                ymin = y - 0.5, ymax = y + 0.5, fill = order),
+            colour = "grey45", linewidth = 0.12) +
+  scale_fill_manual(values = ORD_COL, guide = "none") +
+  geom_rect(data = tip_xy, inherit.aes = FALSE,
+            aes(xmin = r_bar0, xmax = r_bar0 + log2n * bar_scale,
+                ymin = y - 0.40, ymax = y + 0.40),
+            fill = "#1D3557", colour = NA) +
+  geom_text(data = tip_xy,
+            aes(x = lx, y = y, label = label, angle = ang, hjust = hj),
+            size = 2.4, colour = "black", inherit.aes = FALSE)
+
+# Tree panel without the legend / 树图主体，图例单独输出
+save_fig(p, CHAPTER, "Fig_1_host_genus_tree", 320, 320)
+embed_fig(CHAPTER, "Fig_1_host_genus_tree")
+
+# Legend is exported separately with the shared helper / 图例单独导出
+source(file.path(PROJECT_ROOT, "R", "plot_helpers.R"))
+leg_df <- data.frame(category = ord_lev, color = unname(ORD_COL),
+                     stringsAsFactors = FALSE)
+
+leg_pdf <- file.path(ch_dir(CHAPTER, "figures"),
+                     "Fig_1_host_genus_tree_legend.pdf")
+create_color_legend(leg_df, save_path = leg_pdf, shape = "square", layout = "row", n = 2,
+                           title = "Host order", label_size = 2.8,
+                           title_size = 2, ifsave = TRUE)
+cat("tree legend saved:", leg_pdf, "\n")
+p
+```
+
+# 15. Sample summary table (host genus x order) / 样本汇总表
+
+```{r tab-sample-summary}
+# One row per host genus, ordered by the full plant genus tree (122 genera).
+# 每个宿主属一行，按完整植物属树（122 个属）的末端顺序排列。
+tree_full <- read.tree(host_tree_path("plant_Genus_tree_all.nwk"))
+
+sample_summary <- md[!is.na(Genus) & Genus != "", .(
+  samples_16s = sum(dataset == "16S"),
+  samples_its = sum(dataset == "ITS"),
+  studies_16s = uniqueN(Cite[dataset == "16S"]),
+  studies_its = uniqueN(Cite[dataset == "ITS"]),
+  Source_16s  = uniqueN(source[dataset == "16S"]),
+  Source_its  = uniqueN(source[dataset == "ITS"]),
+  source      = paste(unique(source), collapse = "; "),
+  references  = paste(unique(Cite), collapse = "; ")
+), by = .(Order, Genus)]
+
+genus_order <- data.table(index = seq_along(tree_full$tip.label),
+                          Genus = tree_full$tip.label)
+sample_summary <- merge(genus_order, sample_summary, by = "Genus", all.x = TRUE)
+sample_summary <- sample_summary[order(index)]
+sample_summary[, index := NULL]
+setcolorder(sample_summary, c("Genus", "Order",
+                              "samples_16s", "samples_its",
+                              "studies_16s", "studies_its",
+                              "Source_16s", "Source_its",
+                              "source", "references"))
+stopifnot(!anyNA(sample_summary$samples_16s))
+write_tab(sample_summary, CHAPTER, "Tab_1_sample_summary")
+
+cat(sprintf("sample summary: %d genera; 16S %d, ITS %d samples\n",
+            nrow(sample_summary),
+            sum(sample_summary$samples_16s), sum(sample_summary$samples_its)))
+sample_summary
+```
+
+# 16. Run log / 运行记录
+
+```{r run-log}
+figs <- c("Fig_1_samples_by_source",
+          "Fig_1_extract_sterilization_design", "Fig_1_world_map",
+          "Fig_1_host_genus_top10", "Fig_1_reference_mapping_fraction",
+          "Fig_1_host_genus_tree")
+tabs <- c("Tab_1_dataset_overview", "Tab_1_source_registry",
+          "Tab_1_design_counts", "Tab_1_platform_counts",
+          "Tab_1_country_by_region", "Tab_1_sample_summary")
+
+log_lines <- c(
+  sprintf("Chapter 1 run: %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
+  sprintf("metadata: 16S %d, ITS %d, combined %d", nrow(md_16s), nrow(md_its), nrow(md)),
+  sprintf("sources: 16S %d, ITS %d, union %d", uniqueN(md_16s$source),
+          uniqueN(md_its$source), uniqueN(md$source)),
+  sprintf("papers: 16S %d, ITS %d, union %d", uniqueN(md_16s$Cite),
+          uniqueN(md_its$Cite), uniqueN(md$Cite)),
+  sprintf("countries (named, union): %d", n_distinct_nonmissing(md$Country)),
+  sprintf("qualified host genera: 16S %d, ITS %d",
+          tab1[dataset == "16S" & region == "All", qualified_host_genera],
+          tab1[dataset == "ITS" & region == "All", qualified_host_genera]),
+  sprintf("Part A candidates (source-level pooled): %d; analysis units 16S %d, ITS %d",
+          sum(src$partA_candidate), sum(src$partA_16S), sum(src$partA_ITS)),
+  sprintf("Part A samples (source-level pooled): %d",
+          md[source %in% src[partA_candidate == TRUE, source], .N]),
+  sprintf("Part B pools: %d", nrow(pool_ok)),
+  sprintf("study sets (samples): %s",
+          paste(md[, .(n = .N), by = src_group][order(src_group)][,
+                paste0(src_group, "=", n)], collapse = "; ")),
+  sprintf("reference-mapped reads (median): 16S %.1f%%, ITS %.1f%%",
+          median(mf[dataset == "16S"]$mapped_pct),
+          median(mf[dataset == "ITS"]$mapped_pct)),
+  sprintf("host genus tree: %d tips; outputs in %s", Ntip(genus_tree),
+          tree_dir(CHAPTER)),
+  sprintf("tree legend (separate PDF): %s", leg_pdf),
+  sprintf("figures: %s", paste(figs, collapse = ", ")),
+  sprintf("tables: %s", paste(tabs, collapse = ", ")),
+  sprintf("intermediates: %s", paste(ls_int, collapse = ", "))
+)
+write_log(CHAPTER, "Ch1_dataset_run", log_lines)
+cat(paste(log_lines, collapse = "\n"), "\n")
+```
+
+```{r session}
+cat("R:", R.version.string, "\n")
+```

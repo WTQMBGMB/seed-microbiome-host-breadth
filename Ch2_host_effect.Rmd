@@ -1,0 +1,1037 @@
+---
+title: "Chapter 2 - Host effect on seed microbiome"
+output:
+  html_document:
+    toc: false
+    self_contained: false
+params:
+  force_recompute: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = TRUE, warning = TRUE,
+  fig.show = "hide", comment = "#>"
+)
+source(file.path(normalizePath(getwd(), winslash = "/"), "R", "config.R"))
+source(file.path(PROJECT_ROOT, "R", "common.R"))
+suppressMessages({
+  library(data.table)
+  library(ggplot2)
+  library(dplyr)
+  library(vegan)
+  library(lme4)
+  library(metafor)
+  library(ape)
+  library(patchwork)
+})
+ensure_v2_dirs()
+CHAPTER <- "ch2_host_effect"
+FORCE <- isTRUE(params$force_recompute)
+set.seed(20261119)
+# Permutation counts: within-study adonis 1999, alpha 1999, Mantel 9999.
+# 置换次数：研究内 adonis 1999、α 1999、Mantel 9999。
+N_PERM  <- 1999L
+N_PERM_ALPHA <- 1999L
+N_PERM_MANTEL <- 9999L
+B_ICC   <- 500L
+B_DELTA <- 1000L
+progress <- make_progress(CHAPTER)
+```
+
+# 1. Data loading / 数据读取
+
+Region CSS tables are the analysis unit for alpha/beta (sample-level
+genus >= 2 QC; 101 samples fewer than metadata). `SampleID` is **not**
+unique across kingdoms, so every metadata match is done within `dataset`.
+
+```{r data}
+REG_FILES <- c(
+  V3_V4 = "css_v3_v4_asvtab.txt", V4 = "css_v4_asvtab.txt",
+  V5_V6 = "css_v5_v6_asvtab.txt", V5_V7 = "css_v5_v7_asvtab.txt",
+  ITS1  = "css_its1_asvtab.txt",   ITS2 = "css_its2_asvtab.txt"
+)
+REG_DS <- c(V3_V4 = "16S", V4 = "16S", V5_V6 = "16S", V5_V7 = "16S",
+            ITS1 = "ITS", ITS2 = "ITS")
+REG_TREE <- c(V3_V4 = "plant_species_tree_all.nwk",
+              V4    = "plant_species_tree_v4.nwk",
+              V5_V6 = "plant_species_tree_all.nwk",
+              V5_V7 = "plant_species_tree_v5_v7.nwk",
+              ITS1  = "plant_species_tree_its1.nwk",
+              ITS2  = "plant_species_tree_all.nwk")
+
+md_all <- read_all_meta()
+
+region_ids <- setNames(lapply(names(REG_FILES), function(reg) {
+  setdiff(names(fread(css_region_path(tolower(reg), REG_FILES[[reg]]), nrows = 1)), "ASV_ID")
+}), names(REG_FILES))
+cat("region samples:", paste(names(region_ids), lengths(region_ids),
+                             sep = "=", collapse = "  "), "\n")
+
+# sample registry restricted to region-table samples (dataset-aware)
+registry <- rbindlist(lapply(names(region_ids), function(reg) {
+  md_all[dataset == REG_DS[[reg]] & SampleID %in% region_ids[[reg]]]
+}))
+cat("registry:", nrow(registry), "samples\n")
+stopifnot(!anyNA(registry$Genus), all(registry$Genus != ""))
+
+load_region <- function(reg) {
+  raw <- fread(css_region_path(tolower(reg), REG_FILES[[reg]]))
+  ids <- names(raw)[-1]
+  m <- md_all[dataset == REG_DS[[reg]] & SampleID %in% ids]
+  m <- m[match(ids, m$SampleID)]
+  stopifnot(nrow(m) == length(ids), identical(m$SampleID, ids))
+  mat <- t(as.matrix(raw[, -1]))
+  colnames(mat) <- raw[[1]]
+  rownames(mat) <- ids
+  rm(raw); invisible(gc())
+  list(mat = mat, meta = m[])
+}
+
+# ---- Part A units: source x kingdom, >=2 host genera with >=3 samples ----
+qualified_genus <- function(m) {
+  m[, .N, by = Genus][N >= 3, Genus]
+}
+units <- registry[, {
+  gq <- qualified_genus(.SD)
+  if (length(gq) < 2) NULL else .(Region = Region[1], Cite = Cite[1])
+}, by = .(dataset, source)]
+units[, `:=`(unit = paste(Region, source, sep = ":"),
+             kingdom = ifelse(dataset == "16S", "Bacteria", "Fungi"))]
+setorder(units, dataset, Region, source)
+cat("Part A units:", nrow(units), "| unique sources:",
+    uniqueN(units$source), "| samples:",
+    registry[source %in% units$source, .N], "\n")
+print(units[, .(dataset, Region, source, Cite)])
+```
+
+```{r helpers}
+vary_covars <- function(m) {
+  cand <- c("Country", "extract", "IF_SD", "PlatformN")
+  n <- nrow(m)
+  keep <- vapply(cand, function(v) {
+    x <- droplevels(factor(m[[v]]))
+    if (nlevels(x) < 2) return(FALSE)
+    if (nlevels(x) > max(2, floor(n / 5))) return(FALSE)
+    m[, uniqueN(get(v)), by = Genus][V1 > 1, .N] > 0
+  }, logical(1))
+  cand[keep]
+}
+
+covar_df <- function(m, vars) {
+  if (!length(vars)) return(data.frame(row.names = seq_len(nrow(m))))
+  d <- as.data.frame(m[, ..vars])
+  for (v in vars) d[[v]] <- droplevels(factor(d[[v]]))
+  d
+}
+
+keep2 <- function(cd) {
+  if (!ncol(cd)) return(cd)
+  ok <- vapply(cd, function(x) nlevels(droplevels(factor(x))) >= 2, logical(1))
+  cd[, ok, drop = FALSE]
+}
+
+adonis_marg <- function(D, g, cd, nperm = N_PERM) {
+  g <- droplevels(factor(g))
+  if (nlevels(g) < 2)
+    return(data.frame(R2 = NA_real_, `Pr(>F)` = NA_real_, Df = 0))
+  cd <- keep2(cd)
+  d <- data.frame(g = g)
+  if (ncol(cd)) for (v in names(cd)) d[[v]] <- droplevels(factor(cd[[v]]))
+  rhs <- c("g", names(cd))
+  f <- as.formula(paste("D ~", paste(rhs, collapse = " + ")))
+  a <- as.data.frame(adonis2(f, data = d, by = "margin",
+                             permutations = nperm))
+  a$term <- rownames(a)
+  a[a$term == "g", c("R2", "Pr(>F)", "Df")]
+}
+
+icc_moment <- function(y, g) {
+  g <- droplevels(factor(g))
+  if (nlevels(g) < 2) return(0)
+  a <- anova(lm(y ~ g))
+  if (nrow(a) < 2) return(0)
+  msb <- a[1, "Mean Sq"]; msw <- a[2, "Mean Sq"]
+  if (!is.finite(msb) || !is.finite(msw) || msb + msw == 0) return(0)
+  n_i <- table(g); N <- sum(n_i); k <- length(n_i)
+  k0 <- (N - sum(n_i^2) / N) / (k - 1)
+  icc <- (msb - msw) / (msb + (k0 - 1) * msw)
+  max(0, min(1, icc))
+}
+
+fit_icc <- function(y, g, cd) {
+  cd <- keep2(cd)
+  d <- data.frame(y = y, g = droplevels(factor(g)))
+  if (ncol(cd)) for (v in names(cd)) d[[v]] <- droplevels(factor(cd[[v]]))
+  rhs <- c(if (ncol(cd)) names(cd), "(1|g)")
+  f <- as.formula(paste("y ~", paste(rhs, collapse = " + ")))
+  out <- tryCatch({
+    m <- suppressWarnings(lmer(f, data = d, REML = TRUE))
+    vc <- as.data.frame(VarCorr(m))
+    vg <- vc$vcov[vc$grp == "g"]; vr <- vc$vcov[vc$grp == "Residual"]
+    if (!length(vg) || !length(vr) || !is.finite(vg) || !is.finite(vr))
+      stop("bad variance components")
+    vg / (vg + vr)
+  }, error = function(e) NULL)
+  if (is.null(out) || !is.finite(out)) out <- icc_moment(y, g)
+  max(0, min(1, out))
+}
+
+boot_icc <- function(y, g, cd, B = B_ICC) {
+  n <- length(y)
+  v <- vapply(seq_len(B), function(b) {
+    i <- sample.int(n, n, replace = TRUE)
+    if (uniqueN(g[i]) < 2) return(NA_real_)
+    cd_b <- if (ncol(cd)) cd[i, , drop = FALSE] else cd
+    fit_icc(y[i], g[i], cd_b)
+  }, numeric(1))
+  v <- v[is.finite(v)]
+  c(est = mean(v), lo = as.numeric(quantile(v, 0.025)),
+    hi = as.numeric(quantile(v, 0.975)), se = sd(v))
+}
+
+delta_effect <- function(D, grp) {
+  ut <- upper.tri(D)
+  same <- outer(grp, grp, "==")
+  w <- mean(D[ut & same]); b <- mean(D[ut & !same])
+  if (!is.finite(w) || !is.finite(b) || w <= 0) return(NA_real_)
+  log(b / w)
+}
+
+boot_delta <- function(D, grp, B = B_DELTA) {
+  n <- nrow(D)
+  v <- vapply(seq_len(B), function(b) {
+    i <- sample.int(n, n, replace = TRUE)
+    if (uniqueN(grp[i]) < 2) return(NA_real_)
+    dd <- D[i, i, drop = FALSE]
+    ss <- outer(grp[i], grp[i], "==")
+    # resampled copies of the same sample have distance 0; those self-pairs
+    # would deflate the within-group mean and bias Delta upward
+    dup <- outer(i, i, "==")
+    uu <- upper.tri(dd) & !dup
+    w <- mean(dd[uu & ss]); btw <- mean(dd[uu & !ss])
+    if (!is.finite(w) || !is.finite(btw) || w <= 0) return(NA_real_)
+    log(btw / w)
+  }, numeric(1))
+  v <- v[is.finite(v)]
+  c(est = delta_effect(D, grp),
+    lo = as.numeric(quantile(v, 0.025)),
+    hi = as.numeric(quantile(v, 0.975)), se = sd(v))
+}
+
+meta_fit <- function(yi, sei) {
+  ok <- is.finite(yi) & is.finite(sei) & sei > 0
+  yi <- yi[ok]; sei <- sei[ok]; k <- length(yi)
+  if (k == 0) return(c(est = NA, lo = NA, hi = NA, tau2 = NA, I2 = NA,
+                       Q = NA, k = 0))
+  if (k < 3) return(c(est = mean(yi), lo = mean(yi) - 1.96 * mean(sei),
+                      hi = mean(yi) + 1.96 * mean(sei), tau2 = NA,
+                      I2 = NA, Q = NA, k = k))
+  m <- metafor::rma(yi = yi, sei = sei, method = "REML")
+  c(est = as.numeric(m$beta), lo = m$ci.lb, hi = m$ci.ub,
+    tau2 = m$tau2, I2 = m$I2, Q = m$QE, k = k)
+}
+```
+
+# 2. Part A - within-study host effect / 研究内宿主效应
+
+```{r part-a}
+rds_a <- file.path(rds_dir(CHAPTER), "partA_units.rds")
+rds_b <- file.path(rds_dir(CHAPTER), "partB_pools.rds")
+
+if (file.exists(rds_a) && file.exists(rds_b) && !FORCE) {
+  A <- readRDS(rds_a); B <- readRDS(rds_b)
+  cat("Part A/B loaded from cache\n")
+} else {
+  # ---- Part B pool definitions (>=5 sources per Genus x Region) ----
+  pool_def <- registry[, .(n_sources = uniqueN(source)),
+                       by = .(dataset, Region, Genus)]
+  pool_def <- pool_def[n_sources >= 5]
+  pool_def[, pool := paste(Genus, "x", Region)]
+  setorder(pool_def, dataset, Region, Genus)
+  cat("Part B pools:", nrow(pool_def), "| samples:",
+      sum(pool_def$n_sources), "(source counts)\n")
+  print(pool_def)
+
+  eff_rows <- list(); sample_rows <- list(); pcoa_rows <- list()
+  mant_rows <- list()
+  b_eff <- list(); b_ad <- list(); b_comp <- list()
+
+  for (reg in names(region_ids)) {
+    if (!any(units$Region == reg) && !any(pool_def$Region == reg)) next
+    rd <- load_region(reg)
+    cat(sprintf("---- [%s] %d x %d ----\n", reg, nrow(rd$mat),
+                ncol(rd$mat)))
+
+    # ================= Part A units in this region =================
+    for (k in which(units$Region == reg)) {
+      src <- units$source[k]
+      progress("START unit", units$unit[k])
+      m <- rd$meta[source == src]
+      gq <- qualified_genus(m)
+      mu <- m[Genus %in% gq]
+      idx <- match(mu$SampleID, rownames(rd$mat))
+      mat <- rd$mat[idx, , drop = FALSE]
+      mu[, `:=`(Shannon = diversity(mat, "shannon"),
+                Observed = rowSums(mat > 0))]
+      mu[, logObs := log10(Observed)]
+      D <- as.matrix(vegdist(mat, "bray"))
+
+      cv <- vary_covars(mu)
+      cd <- covar_df(mu, cv)
+      grp <- droplevels(factor(mu$Genus))
+      n_sp <- uniqueN(mu$species)
+
+      sample_rows[[length(sample_rows) + 1]] <- mu[
+        , .(unit = units$unit[k], dataset = units$dataset[k],
+            Region = reg, source = src, SampleID, Genus, species, Country,
+            extract, IF_SD, PlatformN, Shannon, Observed, logObs)]
+
+      for (ix in c("Shannon", "logObs")) {
+        y  <- mu[[ix]]
+        icc <- fit_icc(y, grp, cd)
+        bi  <- boot_icc(y, grp, cd)
+        ar  <- adonis_marg(as.dist(dist(y)), grp, cd,
+                           nperm = N_PERM_ALPHA)
+        eff_rows[[length(eff_rows) + 1]] <- data.table(
+          unit = units$unit[k], dataset = units$dataset[k], Region = reg,
+          source = src,
+          index = ifelse(ix == "Shannon", "Shannon", "Observed (log10)"),
+          ICC = icc, ICC_lo = bi[["lo"]], ICC_hi = bi[["hi"]],
+          ICC_se = bi[["se"]], alpha_R2 = ar$R2, alpha_P = ar$`Pr(>F)`,
+          covars = paste(cv, collapse = "+"))
+      }
+
+      bd <- boot_delta(D, grp)
+      br <- adonis_marg(as.dist(D), grp, cd)
+      eff_rows[[length(eff_rows) + 1]] <- data.table(
+        unit = units$unit[k], dataset = units$dataset[k], Region = reg,
+        source = src, index = "beta_delta_host",
+        ICC = bd[["est"]], ICC_lo = bd[["lo"]], ICC_hi = bd[["hi"]],
+        ICC_se = bd[["se"]], alpha_R2 = br$R2, alpha_P = br$`Pr(>F)`,
+        covars = paste(cv, collapse = "+"))
+
+      pc <- cmdscale(D, k = 2, eig = TRUE)
+      eigp <- pc$eig[pc$eig > 0]
+      pcoa_rows[[length(pcoa_rows) + 1]] <- data.table(
+        unit = units$unit[k], SampleID = rownames(pc$points),
+        PCoA1 = pc$points[, 1], PCoA2 = pc$points[, 2],
+        var1 = 100 * eigp[1] / sum(eigp),
+        var2 = 100 * eigp[2] / sum(eigp), Genus = mu$Genus)
+
+      # ---- within-study phylogenetic signal (species >= 8) ----
+      if (n_sp >= 8) {
+        cnt <- table(mu$species)
+        cen <- rowsum(mat, mu$species) / as.vector(cnt)
+        tree <- read.tree(host_tree_path(REG_TREE[[reg]]))
+        sp <- intersect(rownames(cen), tree$tip.label)
+        if (length(sp) >= 8) {
+          Db <- as.matrix(vegdist(cen[sp, , drop = FALSE], "bray"))
+          Ct <- cophenetic(keep.tip(tree, sp))
+          Ct <- Ct[sp, sp, drop = FALSE]
+          mt <- mantel(Db, Ct, method = "pearson",
+                       permutations = N_PERM_MANTEL)
+          mant_rows[[length(mant_rows) + 1]] <- data.table(
+            unit = units$unit[k], dataset = units$dataset[k], Region = reg,
+            source = src, n_species = length(sp), n_samples = nrow(mu),
+            mantel_r = as.numeric(mt$statistic),
+            mantel_P = as.numeric(mt$signif))
+        }
+      }
+      cat(sprintf("  A [%s] n=%d G=%d sp=%d covars=%s\n", units$unit[k],
+                  nrow(mu), nlevels(grp), n_sp,
+                  ifelse(length(cv), paste(cv, collapse = "+"), "-")))
+      progress("DONE unit", units$unit[k])
+    }
+
+    # ================= Part B pools in this region =================
+    for (k in which(pool_def$Region == reg)) {
+      gen <- pool_def$Genus[k]
+      progress("START pool", pool_def$pool[k])
+      m <- rd$meta[Genus == gen]
+      idx <- match(m$SampleID, rownames(rd$mat))
+      mat <- rd$mat[idx, , drop = FALSE]
+      D <- as.matrix(vegdist(mat, "bray"))
+
+      terms_all <- c(source = "source", country = "Country",
+                     extract = "extract", IF_SD = "IF_SD",
+                     platform = "PlatformN")
+      terms_all <- terms_all[vapply(terms_all, function(v)
+        uniqueN(m[[v]]) >= 2, logical(1))]
+      cd <- covar_df(m, unname(terms_all))
+      f <- as.formula(paste("as.dist(D) ~",
+                            paste(names(cd), collapse = " + ")))
+      ad <- adonis2(f, data = cd, by = "margin",
+                    permutations = N_PERM)
+      adt <- as.data.frame(ad); adt$term <- rownames(adt)
+      adt <- adt[!adt$term %in% c("Residual", "Total"), ]
+
+      b_ad[[length(b_ad) + 1]] <- data.table(
+        pool = pool_def$pool[k], dataset = pool_def$dataset[k],
+        Region = reg, Genus = gen, term = adt$term, Df = adt$Df,
+        R2 = adt$R2, P = adt$`Pr(>F)`)
+
+      for (tn in names(terms_all)) {
+        v <- terms_all[[tn]]
+        grp <- droplevels(factor(m[[v]]))
+        bd <- boot_delta(D, grp)
+        row <- match(v, adt$term)
+        b_eff[[length(b_eff) + 1]] <- data.table(
+          pool = pool_def$pool[k], dataset = pool_def$dataset[k],
+          Region = reg, Genus = gen, term = tn,
+          n_levels = nlevels(grp), n = nrow(m),
+          delta = bd[["est"]], lo = bd[["lo"]], hi = bd[["hi"]],
+          se = bd[["se"]],
+          R2 = if (is.na(row)) NA_real_ else adt$R2[row],
+          P  = if (is.na(row)) NA_real_ else adt$`Pr(>F)`[row])
+      }
+      b_comp[[length(b_comp) + 1]] <- data.table(
+        pool = pool_def$pool[k], dataset = pool_def$dataset[k], Region = reg,
+        Genus = gen, n_samples = nrow(m), n_sources = uniqueN(m$source),
+        n_countries = uniqueN(m$Country),
+        extract = paste(sort(unique(m$extract)), collapse = "+"),
+        IF_SD = paste(sort(unique(m$IF_SD)), collapse = "+"),
+        platform = paste(sort(unique(m$PlatformN)), collapse = "+"),
+        terms_ok = paste(names(terms_all), collapse = "+"))
+      cat(sprintf("  B [%s] n=%d src=%d terms=%s\n", pool_def$pool[k],
+                  nrow(m), uniqueN(m$source),
+                  paste(names(terms_all), collapse = "+")))
+      progress("DONE pool", pool_def$pool[k])
+    }
+    rm(rd); invisible(gc())
+  }
+
+  A <- list(effects = rbindlist(eff_rows),
+            samples = rbindlist(sample_rows),
+            pcoa = rbindlist(pcoa_rows),
+            units = units, mantel = rbindlist(mant_rows))
+  B <- list(effects = rbindlist(b_eff), adonis = rbindlist(b_ad),
+            composition = rbindlist(b_comp), pool_def = pool_def)
+  saveRDS(A, rds_a); saveRDS(B, rds_b)
+}
+```
+
+```{r part-a-meta}
+ae <- copy(A$effects)
+ae[index != "beta_delta_host",
+   alpha_q := p.adjust(alpha_P, "BH"), by = index]
+ae[index == "beta_delta_host",
+   beta_q := p.adjust(alpha_P[index == "beta_delta_host"], "BH")]
+ae[, sig := alpha_q < 0.05]
+
+a_alpha <- ae[index != "beta_delta_host"]
+a_beta  <- ae[index == "beta_delta_host"]
+n_by_unit <- A$samples[, .N, by = unit]
+
+meta_icc <- rbindlist(lapply(split(a_alpha, a_alpha$index), function(d) {
+  z  <- atanh(pmin(d$ICC, 1 - 1e-6))
+  n  <- n_by_unit$N[match(d$unit, n_by_unit$unit)]
+  se <- pmax(d$ICC_se / (1 - pmin(d$ICC, 1 - 1e-6)^2), 1 / sqrt(n))
+  mz <- meta_fit(z, se)
+  data.table(index = d$index[1], est = tanh(mz[["est"]]),
+             lo = tanh(mz[["lo"]]), hi = tanh(mz[["hi"]]),
+             tau2 = mz[["tau2"]], I2 = mz[["I2"]], k = mz[["k"]])
+}))
+mb <- meta_fit(a_beta$ICC, a_beta$ICC_se)
+meta_beta <- data.table(est = mb[["est"]], lo = mb[["lo"]],
+                        hi = mb[["hi"]], tau2 = mb[["tau2"]],
+                        I2 = mb[["I2"]], Q = mb[["Q"]], k = mb[["k"]],
+                        index = "beta_delta_host")
+A$meta_icc <- meta_icc; A$meta_beta <- meta_beta
+saveRDS(A[c("meta_icc", "meta_beta")],
+        file.path(rds_dir(CHAPTER), "partA_meta.rds"))
+print(meta_icc)
+print(meta_beta)
+cat("\nalpha units q<0.05:", a_alpha[sig == TRUE, .N], "/", nrow(a_alpha),
+    "\nbeta units q<0.05:", a_beta[sig == TRUE, .N], "/", nrow(a_beta), "\n")
+print(a_alpha[order(index, -ICC),
+              .(unit, index, ICC, ICC_lo, ICC_hi, alpha_R2, alpha_P,
+                alpha_q)])
+print(a_beta[order(-ICC),
+             .(unit, ICC, ICC_lo, ICC_hi, alpha_R2, alpha_P, beta_q)])
+```
+
+```{r part-a-mantel}
+mt <- A$mantel
+mt[, z := atanh(mantel_r)]
+mt[, se := 1 / sqrt(n_species - 3)]
+mf <- meta_fit(mt$z, mt$se)
+mt_meta <- data.table(est_r = tanh(mf[["est"]]), lo_r = tanh(mf[["lo"]]),
+                      hi_r = tanh(mf[["hi"]]), tau2 = mf[["tau2"]],
+                      I2 = mf[["I2"]], k = mf[["k"]])
+print(mt[order(-mantel_r)])
+print(mt_meta)
+```
+
+```{r part-b-meta}
+bmeta <- rbindlist(lapply(c("source", "country", "extract", "IF_SD",
+                            "platform"), function(tn) {
+  d <- B$effects[term == tn]
+  if (tn %in% c("extract", "IF_SD"))
+    d <- d[!(Genus == "Phaseolus" & Region == "ITS1")]
+  mf <- meta_fit(d$delta, d$se)
+  data.table(term = tn, est = mf[["est"]], lo = mf[["lo"]],
+             hi = mf[["hi"]], tau2 = mf[["tau2"]], I2 = mf[["I2"]],
+             k = mf[["k"]])
+}))
+B$meta <- bmeta
+saveRDS(B[c("effects", "adonis", "composition", "pool_def", "meta")],
+        rds_b)
+print(B$composition)
+print(bmeta)
+print(B$effects[term == "source"][order(-delta),
+                                  .(pool, n, delta, lo, hi, R2, P)])
+print(B$adonis[pool == "Brassica x V4"])
+```
+
+# 5. Tables / 结果表
+
+```{r tables}
+term_lab <- c(source = "Study source", country = "Country",
+              extract = "Tissue", IF_SD = "Sterilisation",
+              platform = "Platform")
+col_map <- c(source = "source", country = "Country", extract = "extract",
+             IF_SD = "IF_SD", platform = "PlatformN")
+ut <- copy(A$units)
+ut[, n_samples := A$samples[, .N, by = unit][match(ut$unit, unit), N]]
+ut[, n_genera := A$samples[, uniqueN(Genus), by = unit][
+  match(ut$unit, unit), V1]]
+ut[, n_species := A$samples[, uniqueN(species), by = unit][
+  match(ut$unit, unit), V1]]
+ut[, n_countries := A$samples[, uniqueN(Country), by = unit][
+  match(ut$unit, unit), V1]]
+ut[, covars := ae[index == "Shannon"][match(ut$unit, unit), covars]]
+ut[, tissue := A$samples[, paste(sort(unique(extract)), collapse = "+"),
+                         by = unit][match(ut$unit, unit), V1]]
+ut[, sterilization := A$samples[, paste(sort(unique(IF_SD)), collapse = "+"),
+                                by = unit][match(ut$unit, unit), V1]]
+ut[, platform := A$samples[, paste(sort(unique(PlatformN)), collapse = "+"),
+                           by = unit][match(ut$unit, unit), V1]]
+write_tab(ut, CHAPTER, "Tab_2_partA_units")
+
+ex <- ae[, .(unit, dataset, Region, source, index,
+             est = ICC, lo = ICC_lo, hi = ICC_hi, se = ICC_se,
+             partial_R2 = alpha_R2, P = alpha_P,
+             P_adj = fifelse(index == "beta_delta_host", beta_q, alpha_q),
+             covars)]
+write_tab(ex, CHAPTER, "Tab_2_partA_effects")
+
+write_tab(A$mantel, CHAPTER, "Tab_2_partA_mantel")
+write_tab(B$composition, CHAPTER, "Tab_2_partB_pool_composition")
+
+be <- copy(B$effects)
+adk <- copy(B$adonis)[, key := paste(pool, term)]
+be[, key := paste(pool, col_map[term])]
+be[, `:=`(Df = adk$Df[match(key, adk$key)],
+          estimable = !is.na(adk$P[match(key, adk$key)]))]
+setnames(be, c("R2", "P"), c("R2_marginal", "P_adonis"))
+be[, `:=`(pool = gsub(" x ", " × ", pool), term = term_lab[term])]
+be[, key := NULL]
+write_tab(be, CHAPTER, "Tab_2_partB_effects")
+cat("tables written\n")
+```
+
+# 6. Figures / 图件
+
+```{r fig-helpers}
+reg_lab <- c(V3_V4 = "V3-V4", V4 = "V4", V5_V6 = "V5-V6", V5_V7 = "V5-V7",
+             ITS1 = "ITS1", ITS2 = "ITS2")
+REG4 <- setNames(REG_COL[c("V4", "V5_V7", "ITS1", "ITS2")],
+                 c("V4", "V5-V7", "ITS1", "ITS2"))
+meta_txt2 <- function(m) {
+  if (is.na(m$tau2)) return("no~pooled~estimate")
+  sprintf("I^2 == %d*\"%%,\" ~ tau^2 == %.2f",
+          round(m$I2), m$tau2)
+}
+
+forest_panel_h <- function(d, ylab, meta_row, col_map,
+                           show_x = TRUE, ylim = NULL,
+                           legend = "none") {
+  d <- copy(as.data.table(d))
+  k <- nrow(d)
+  d[, x := seq_len(k)]
+  if (is.null(ylim)) {
+    ylim <- range(c(d$lo, d$hi, 0, meta_row$lo, meta_row$hi), na.rm = TRUE)
+    pad <- diff(ylim) * 0.06
+    ylim <- ylim + c(-pad, pad)
+  }
+  xd <- k + 1.05
+  dx <- 0.20
+  dm <- data.frame(
+    x = c(xd, xd + dx, xd, xd - dx),
+    y = c(meta_row$lo, meta_row$est, meta_row$hi, meta_row$est)
+  )
+  ann_y <- ylim[2] - 0.02 * diff(ylim)
+  ggplot() +
+    geom_hline(yintercept = 0, colour = "grey55", linewidth = 0.3) +
+    geom_segment(data = d,
+                 aes(x = x, xend = x, y = lo, yend = hi,
+                     colour = reg4),
+                 linewidth = 0.45, show.legend = FALSE) +
+    geom_point(data = d, aes(x = x, y = est, fill = reg4),
+               shape = 21, size = 2.8, stroke = 0.3) +
+    geom_polygon(data = dm, aes(x = x, y = y), fill = "black") +
+    annotate("text", x = k + 1.38, y = ann_y,
+             label = meta_txt2(meta_row), parse = TRUE,
+             hjust = 1, vjust = 1, size = 2.8) +
+    scale_x_continuous(breaks = seq_len(k),
+                       labels = if (show_x) d$lab else rep("", k),
+                       expand = c(0, 0)) +
+    scale_y_continuous(breaks = scales::pretty_breaks(4)) +
+    coord_cartesian(xlim = c(0.4, k + 1.45), ylim = ylim) +
+    scale_colour_manual(values = col_map, name = "Region") +
+    scale_fill_manual(values = col_map, name = "Region") +
+    labs(x = if (show_x) "Study (host genus count)" else NULL, y = ylab) +
+    theme_seed(8) +
+    theme(panel.grid.major.x = element_blank(),
+          panel.grid.minor = element_blank(),
+          axis.text.x = if (show_x)
+            element_text(angle = 60, hjust = 1, vjust = 1, size = 12)
+          else element_blank(),
+          axis.ticks.x = if (show_x) element_line() else element_blank(),
+          axis.text.y = element_text(size = 12),
+          axis.title.x = element_text(size = 12),
+          axis.title.y = element_text(size = 12),
+          legend.position = legend,
+          legend.direction = "horizontal",
+          legend.key.size = unit(2.8, "mm"),
+          legend.text = element_text(size = 8))
+}
+
+# Figure-level copy adds kingdom and the four displayed regions.
+# 作图用副本补充 kingdom 与四个展示区段。
+ae <- copy(A$effects)
+ae[, `:=`(kingdom = ifelse(dataset == "16S", "Bacteria", "Fungi"),
+          est = ICC, lo = ICC_lo, hi = ICC_hi,
+          reg4 = factor(Region,
+                        levels = c("V4", "V5_V7", "ITS1", "ITS2"),
+                        labels = c("V4", "V5-V7", "ITS1", "ITS2")))]
+ma <- readRDS(file.path(rds_dir(CHAPTER), "partA_meta.rds"))
+A$meta_icc <- ma$meta_icc; A$meta_beta <- ma$meta_beta
+
+order_units <- function(d) {
+  d[order(dataset, factor(Region, levels = REG_LEVELS), -ICC)]
+}
+```
+
+```{r fig-host-effect-forest}
+uord <- order_units(ae[index == "Shannon"])
+ugen <- A$samples[, .(n_genera = uniqueN(Genus)), by = unit]
+uord[ugen, n_genera := i.n_genera, on = "unit"]
+stopifnot(!anyNA(uord$n_genera), !anyDuplicated(uord$unit))
+uord[, lab := paste0(source, " (", n_genera, ")")]
+
+panel_dt <- function(ix) {
+  d <- ae[index == ix][match(uord$unit, unit)]
+  stopifnot(nrow(d) == nrow(uord), !anyNA(d$unit))
+  d[, lab := uord$lab]
+  d[]
+}
+
+p_beta <- forest_panel_h(
+  panel_dt("beta_delta_host"),
+  expression(atop(Delta~host, (log~BC~ratio))), A$meta_beta, REG4,
+  show_x = FALSE, legend = "top"
+)
+p_sh <- forest_panel_h(
+  panel_dt("Shannon"),
+  "Shannon ICC", A$meta_icc[index == "Shannon"], REG4,
+  show_x = FALSE, ylim = c(-0.02, 1.02), legend = "none"
+)
+p_ob <- forest_panel_h(
+  panel_dt("Observed (log10)"),
+  "Observed (log10) ICC", A$meta_icc[index == "Observed (log10)"], REG4,
+  show_x = TRUE, ylim = c(-0.02, 1.02), legend = "none"
+)
+p <- p_beta / p_sh / p_ob +
+  plot_layout(heights = c(1, 1, 1), guides = "collect") &
+  theme(legend.position = "top")
+save_fig(p, CHAPTER, "Fig_2_host_effect_forest", 336, 230)
+embed_fig(CHAPTER, "Fig_2_host_effect_forest")
+print(A$meta_icc)
+print(A$meta_beta)
+```
+
+```{r fig-alpha-boxplots}
+# Layered alpha-diversity boxplots with Kruskal-Wallis panels.  The layout is
+# kept from the original pipeline; host Order colours follow the Chapter 1 tree.
+# 分层 α 多样性箱线图与 K-W 标注沿用原流程；Order 配色继承第一章宿主树。
+hsu <- new.env(parent = globalenv())
+sys.source(file.path(PROJECT_ROOT, "R", "alpha_boxplot.R"), envir = hsu)
+
+REGIONS3 <- c("v4", "v5_v7", "its1")
+all_alpha <- setNames(lapply(REGIONS3, function(reg) {
+  a <- as.data.frame(readRDS(precomp_path(sprintf("alpha_div_%s.rds", reg), "alphabeta")))
+  list(alpha = a, meta = a[, c("SampleID", "Order", "Family", "Genus")])
+}), REGIONS3)
+
+# flat map: Order, Family and Genus all inherit the host-tree Order colour
+ocm <- fread(file.path(tree_dir("ch1_dataset"), "host_order_colors.tsv"))
+ord_col <- setNames(ocm$colour, ocm$Order)
+tax <- rbindlist(lapply(all_alpha, function(d)
+  as.data.table(d$alpha)[, .(Order, Family, Genus)]))
+tax <- unique(tax[!is.na(Order) & Order != ""])
+ord_all <- sort(unique(tax$Order))
+extra <- setdiff(ord_all, names(ord_col))
+ord_col_all <- setNames(rep(NA_character_, length(ord_all)), ord_all)
+ord_col_all[names(ord_col)] <- ord_col
+if (length(extra))
+  ord_col_all[extra] <- PAL_MULTI[nrow(ocm) + seq_along(extra)]
+stopifnot(!anyNA(ord_col_all))
+fam_col <- setNames(ord_col_all[tax$Order], tax$Family)
+fam_col <- fam_col[!is.na(names(fam_col)) & names(fam_col) != ""]
+gen_col <- setNames(ord_col_all[tax$Order], tax$Genus)
+gen_col <- gen_col[!is.na(names(gen_col)) & names(gen_col) != ""]
+flat_tree <- list(order = ord_col_all, family = fam_col, genus = gen_col)
+
+kw_sh <- hsu$layered_boxplot(all_alpha, flat_tree, alpha_idx = "Shannon",
+                             out_dir = ch_dir(CHAPTER, "figures"),
+                             prefix = "Fig_2_alpha_boxplot_shannon")
+kw_ob <- hsu$layered_boxplot(all_alpha, flat_tree, alpha_idx = "Observed",
+                             out_dir = ch_dir(CHAPTER, "figures"),
+                             prefix = "Fig_2_alpha_boxplot_observed",
+                             log10_transform = TRUE)
+embed_fig(CHAPTER, c("Fig_2_alpha_boxplot_shannon",
+                     "Fig_2_alpha_boxplot_observed"))
+kw <- rbind(cbind(Index = "Shannon", kw_sh$kw_results),
+            cbind(Index = "Observed", kw_ob$kw_results))
+write_tab(kw, CHAPTER, "Tab_2_alpha_boxplot_kw")
+print(kw)
+```
+
+```{r partb-pcoa}
+# Per-pool PCoA for the same-Genus cross-study figure.  Distances are
+# recomputed from the region CSS tables and cached because the plot chunk is
+# otherwise cheap to re-run.
+pb_rds <- file.path(rds_dir(CHAPTER), "partB_pcoa.rds")
+if (file.exists(pb_rds) && !FORCE) {
+  PB <- readRDS(pb_rds)
+} else {
+  pdef <- copy(B$pool_def)
+  PB <- rbindlist(lapply(unique(pdef$Region), function(reg) {
+    rd <- load_region(reg)
+    out <- list()
+    for (k in which(pdef$Region == reg)) {
+      gen <- pdef$Genus[k]
+      m <- rd$meta[Genus == gen]
+      idx <- match(m$SampleID, rownames(rd$mat))
+      D <- as.matrix(vegdist(rd$mat[idx, , drop = FALSE], "bray"))
+      pc <- cmdscale(D, k = 2, eig = TRUE)
+      eigp <- pc$eig[pc$eig > 0]
+      out[[length(out) + 1]] <- data.table(
+        pool = pdef$pool[k], dataset = pdef$dataset[k], Region = reg,
+        Genus = gen, SampleID = m$SampleID, source = m$source,
+        Country = m$Country,
+        PCoA1 = pc$points[, 1], PCoA2 = pc$points[, 2],
+        var1 = 100 * eigp[1] / sum(eigp),
+        var2 = 100 * eigp[2] / sum(eigp))
+    }
+    rm(rd); invisible(gc())
+    rbindlist(out)
+  }))
+  saveRDS(PB, pb_rds)
+}
+cat("Part B PCoA:", nrow(PB), "samples;", uniqueN(PB$pool), "pools\n")
+```
+
+```{r fig-partb-effects}
+# Panel A: one effect matrix for the six same-Genus pools.
+# x = delta (log BC between/within), 95% CI; point size = marginal R2;
+# open/grey x = not estimable; black diamond = pooled estimate (k >= 3).
+pool_levels <- c("Brassica x V4", "Brassica x ITS1", "Oryza x V4",
+                 "Phaseolus x V4", "Phaseolus x ITS1", "Solanum x V4")
+flev  <- c("source", "country", "extract", "IF_SD", "platform")
+fdisp <- c("Study source", "Country", "Tissue", "Sterilisation", "Platform")
+
+d <- copy(B$effects)
+d <- d[B$composition, on = "pool",
+       `:=`(n_samples = i.n_samples, n_sources = i.n_sources)]
+d[, factor := factor(term, levels = flev, labels = fdisp)]
+d[, pool := factor(pool, levels = pool_levels)]
+d[, Region := factor(Region, levels = c("V4", "ITS1"))]
+d[, estimable := !is.na(P) & !is.na(R2) & R2 > 0]
+d[, sig := estimable & P <= 0.05]
+d[, star := ifelse(!sig, "", ifelse(P <= 0.001, "***",
+                  ifelse(P <= 0.01, "**", ifelse(P <= 0.05, "*", "ns"))))]
+d[, R2_plot := ifelse(estimable, R2, NA_real_)]
+
+plab_dt <- unique(d[, .(pool, Genus, Region, n_samples, n_sources)])
+plab_dt[, lab := sprintf("%s × %s\nn=%d · %d sources",
+                         Genus, Region, n_samples, n_sources)]
+plab <- setNames(plab_dt$lab, as.character(plab_dt$pool))
+plab <- c(plab[pool_levels], Pooled = "Pooled")
+
+mmeta <- copy(B$meta)
+mmeta[, factor := factor(term, levels = flev, labels = fdisp)]
+mmeta <- mmeta[match(flev, term)]
+facet_lab <- setNames(
+  sprintf("%s\n%s", fdisp,
+          ifelse(is.na(mmeta$I2),
+                 sprintf("k = %d", mmeta$k),
+                 sprintf("I² = %.0f%%; k = %d", mmeta$I2, mmeta$k))),
+  fdisp)
+
+dm <- mmeta[k >= 3]
+dm[, pool := factor("Pooled", levels = c(pool_levels, "Pooled"))]
+d_est <- d[estimable == TRUE]
+d_ne  <- d[estimable == FALSE]
+
+p <- ggplot() +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.3) +
+  geom_errorbar(data = d_est,
+                aes(y = pool, xmin = lo, xmax = hi, colour = Region),
+                orientation = "y", width = 0.18,
+                linewidth = 0.45, alpha = 0.85) +
+  geom_errorbar(data = d_ne,
+                aes(y = pool, xmin = lo, xmax = hi),
+                orientation = "y", width = 0.18,
+                linewidth = 0.35, colour = "grey70", linetype = "dashed") +
+  geom_point(data = d_est,
+             aes(y = pool, x = delta, fill = Region, size = R2_plot),
+             shape = 21, colour = "grey25", stroke = 0.25) +
+  geom_point(data = d_ne, aes(y = pool, x = delta),
+             shape = 4, size = 2.3, colour = "grey40") +
+  geom_text(data = d_est[sig == TRUE],
+            aes(y = pool, x = delta, label = star),
+            vjust = -1.35, size = 2.3) +
+  geom_point(data = dm, aes(y = pool, x = est),
+             shape = 18, size = 3.1, colour = "black") +
+  facet_grid(. ~ factor, scales = "free_x", space = "free_x",
+             labeller = as_labeller(facet_lab)) +
+  scale_y_discrete(limits = rev(c(pool_levels, "Pooled")), labels = plab,
+                   expand = expansion(add = 0.25)) +
+  scale_fill_manual(values = c(V4 = "#3D405B", ITS1 = "#F4A261"),
+                    name = "Region") +
+  scale_colour_manual(values = c(V4 = "#3D405B", ITS1 = "#F4A261"),
+                      guide = "none") +
+  scale_size_area(name = expression("Marginal " * R^2),
+                  max_size = 5.5, limits = c(0, 0.35),
+                  breaks = c(0.05, 0.15, 0.25),
+                  labels = scales::percent) +
+  labs(x = expression(Delta == "log(BC between / BC within level)"),
+       y = NULL,
+       caption = "× = not estimable (dashed CI descriptive only); ◆ = pooled estimate (k ≥ 3)") +
+  theme_bw(base_size = 9) +
+  theme(panel.grid.minor = element_blank(),
+        panel.spacing.x = unit(2.5, "mm"),
+        strip.text = element_text(face = "bold", size = 7.5, lineheight = 0.95),
+        axis.text.y = element_text(size = 7.5, lineheight = 0.9),
+        axis.text.x = element_text(size = 8),
+        axis.title.x = element_text(size = 9),
+        legend.position = "bottom",
+        legend.box = "horizontal",
+        legend.text = element_text(size = 7.5),
+        legend.title = element_text(size = 8),
+        plot.caption = element_text(size = 7, hjust = 0))
+save_fig(p, CHAPTER, "Fig_2_partB_effect_matrix", 195, 89.25)
+embed_fig(CHAPTER, "Fig_2_partB_effect_matrix")
+```
+
+```{r fig-partb-pcoa}
+pb <- copy(PB)
+pb <- pb[B$composition, on = "pool",
+         `:=`(n_samples = i.n_samples, n_sources = i.n_sources)]
+pb[, pool := factor(pool, levels = pool_levels)]
+pb[, source := factor(source)]
+cen <- pb[, .(PCoA1 = mean(PCoA1), PCoA2 = mean(PCoA2), n = .N),
+          by = .(pool, source)]
+
+mk_pool <- function(pl) {
+  d <- pb[pool == pl]
+  cc <- cen[pool == pl]
+  src <- droplevels(d$source)
+  cols <- setNames(scales::hue_pal()(nlevels(src)), levels(src))
+  ggplot(d, aes(PCoA1, PCoA2)) +
+    geom_point(size = 0.45, alpha = 0.22, colour = "grey55",
+               show.legend = FALSE) +
+    geom_point(data = cc, aes(fill = source), shape = 21, size = 2.2,
+               colour = "grey15", stroke = 0.3, show.legend = FALSE) +
+    ggrepel::geom_text_repel(data = cc, aes(label = source), size = 2.1,
+                             min.segment.length = 0, max.overlaps = Inf,
+                             force = 5, box.padding = 0.35,
+                             point.padding = 0.10, segment.size = 0.2,
+                             seed = 1, show.legend = FALSE) +
+    scale_fill_manual(values = cols) +
+    scale_x_continuous(expand = expansion(mult = 0.08)) +
+    scale_y_continuous(expand = expansion(mult = 0.08)) +
+    labs(x = sprintf("PCoA1 (%.1f%%)", d$var1[1]),
+         y = sprintf("PCoA2 (%.1f%%)", d$var2[1]),
+         title = sprintf("%s × %s (n=%d; %d sources)",
+                         d$Genus[1], d$Region[1], nrow(d),
+                         nlevels(droplevels(d$source)))) +
+    theme_bw(base_size = 8) +
+    theme(panel.grid.minor = element_blank(),
+          plot.title = element_text(face = "bold", size = 8.5, hjust = 0.5),
+          axis.text = element_text(size = 7),
+          axis.title = element_text(size = 7.5))
+}
+p <- patchwork::wrap_plots(lapply(pool_levels, mk_pool), nrow = 3) +
+  patchwork::plot_annotation(tag_levels = "a")
+save_fig(p, CHAPTER, "Fig_2_partB_pcoa_by_pool", 195, 150)
+embed_fig(CHAPTER, "Fig_2_partB_pcoa_by_pool")
+```
+
+```{r mixed-adonis}
+# Mixed-pool PERMANOVA: bray ~ Host Genus + source + Other,
+# with Other = interaction(Country, IF_SD, PlatformN) and by = "margin".
+# 合并池 PERMANOVA：三个固定效应，Other 为三个设计变量的交互；按边际检验。
+# The server result (1999 permutations, 200 threads) is read by default;
+# local recomputation requires SEED_ALLOW_SERVER_RECOMPUTE=true.
+# 默认读取服务器结果；本地重算需显式允许。
+MIXED_NPERM <- 1999L
+MIXED_NCORE <- SEED_NCORE
+mixed_rds <- file.path(rds_dir(CHAPTER), "mixed_pool_adonis.rds")
+term_disp <- c(Genus = "Host Genus", source = "Source", Other = "Other")
+
+mixed_design <- function(reg) {
+  ds <- if (reg == "its1") "ITS" else "16S"
+  bd <- readRDS(bray_path(reg))
+  labs <- attr(bd, "Labels")
+  m <- md_all[dataset == ds][match(labs, SampleID)]
+  stopifnot(nrow(m) == length(labs), all(!is.na(m$SampleID)))
+  m[, Other := interaction(Country, IF_SD, PlatformN, drop = TRUE, sep = "|")]
+  keep <- complete.cases(m[, .(Genus, source, Country, IF_SD, PlatformN)])
+  m <- m[keep]; labs <- labs[keep]
+  design <- data.frame(
+    Genus  = droplevels(factor(m$Genus)),
+    source = droplevels(factor(m$source)),
+    Other  = droplevels(factor(m$Other)))
+  rownames(design) <- labs
+  list(dist = as.dist(as.matrix(bd)[keep, keep, drop = FALSE]),
+       design = design, labels = labs, reg = reg)
+}
+
+run_mixed_adonis <- function(nperm = MIXED_NPERM, ncore = MIXED_NCORE) {
+  rbindlist(lapply(c("v4", "v5_v7", "its1"), function(reg) {
+    x <- mixed_design(reg)
+    D <- x$dist
+    set.seed(20261120)
+    ad <- adonis2(D ~ Genus + source + Other, data = x$design,
+                  by = "margin", permutations = nperm, parallel = ncore)
+    at <- as.data.frame(ad); at$term <- rownames(at)
+    at <- at[!at$term %in% c("Residual", "Total"), ]
+    data.table(Region = reg, term = at$term, Df = at$Df,
+               SumOfSqs = at$SumOfSqs, R2 = at$R2, F = at$F,
+               P = at$`Pr(>F)`, n = nrow(x$design),
+               n_genus = nlevels(x$design$Genus),
+               n_source = nlevels(x$design$source),
+               n_other = nlevels(x$design$Other),
+               nperm = nperm, ncore = ncore)
+  }))
+}
+
+if (file.exists(mixed_rds) && !FORCE) {
+  MAD <- readRDS(mixed_rds)
+  cat("mixed-pool adonis loaded from server_result / 读取服务器结果\n")
+} else if (ALLOW_SERVER_RECOMPUTE) {
+  MAD <- run_mixed_adonis()
+  saveRDS(MAD, mixed_rds)
+} else {
+  stop("mixed_pool_adonis.rds is missing; provide server_result/ch2/ or set ",
+       "SEED_ALLOW_SERVER_RECOMPUTE=true.", call. = FALSE)
+}
+write_tab(MAD, CHAPTER, "Tab_2_mixed_pool_adonis")
+print(MAD)
+```
+
+```{r fig-mixed-pool}
+# Host Order colours follow the Chapter 1 host tree: orders are ordered by
+# their first appearance along the pruned tree tips, and colours are assigned
+# in that order from PAL_MULTI (exported by Ch1 to host_order_colors.tsv).
+ocm <- fread(file.path(tree_dir("ch1_dataset"), "host_order_colors.tsv"))
+mix <- rbindlist(lapply(c("v4", "v5_v7", "its1"), function(reg) {
+  x <- mixed_design(reg)
+  pc <- cmdscale(x$dist, k = 2, eig = TRUE)
+  eigp <- pc$eig[pc$eig > 0]
+  ds <- if (reg == "its1") "ITS" else "16S"
+  m <- md_all[dataset == ds][match(x$labels, SampleID)]
+  data.table(Region = reg, Order = m$Order,
+             PCoA1 = pc$points[, 1], PCoA2 = pc$points[, 2],
+             var1 = 100 * eigp[1] / sum(eigp),
+             var2 = 100 * eigp[2] / sum(eigp))
+}))
+present <- unique(mix$Order[!is.na(mix$Order)])
+extra   <- setdiff(present, ocm$Order)
+ord_present <- c(ocm$Order[ocm$Order %in% present], sort(extra))
+mix[, Order := factor(Order, levels = ord_present)]
+mix[, Region := factor(c(v4 = "V4", v5_v7 = "V5-V7", its1 = "ITS1")[Region],
+                       levels = c("V4", "V5-V7", "ITS1"))]
+mix_col <- setNames(ocm$colour[match(ord_present, ocm$Order)], ord_present)
+if (length(extra))
+  mix_col[extra] <- PAL_MULTI[nrow(ocm) + seq_along(extra)]
+stopifnot(!anyNA(mix_col), !anyDuplicated(mix_col))
+
+fmt_p <- function(p) ifelse(is.na(p), "",
+                     ifelse(p <= 0.001, "***",
+                     ifelse(p <= 0.01, "**",
+                     ifelse(p <= 0.05, "*", "ns"))))
+ann <- rbindlist(lapply(levels(mix$Region), function(rg) {
+  r <- c("V4" = "v4", "V5-V7" = "v5_v7", "ITS1" = "its1")[[rg]]
+  d <- copy(MAD[Region == r])
+  d[, name := term_disp[term]]
+  d <- d[order(-R2)]
+  data.table(Region = factor(rg, levels = levels(mix$Region)),
+             lab = paste(sprintf("%-10s R²=%.3f %s",
+                                 d$name, d$R2, fmt_p(d$P)),
+                         collapse = "\n"))
+}))
+
+pcoa_panels <- lapply(levels(mix$Region), function(rg) {
+  d <- mix[Region == rg]
+  a <- ann[Region == rg]
+  ggplot(d, aes(PCoA1, PCoA2)) +
+    geom_point(aes(colour = Order), size = 2.55, alpha = 0.7) +
+    scale_colour_manual(values = mix_col, breaks = ord_present,
+                        name = "Host Order", na.value = "#9E9E9E",
+                        drop = FALSE) +
+    annotate("label", x = Inf, y = Inf, label = a$lab,
+             hjust = 1.02, vjust = 1.1, size = 3.2, lineheight = 1.0,
+             fill = "white", colour = "black", fontface = "plain") +
+    labs(x = sprintf("PCoA1 (%.2f%%)", d$var1[1]),
+         y = sprintf("PCoA2 (%.2f%%)", d$var2[1]),
+         title = rg) +
+    theme_bw(base_size = 11) +
+    theme(panel.grid.minor = element_blank(),
+          plot.title = element_text(face = "bold", hjust = 0.5, size = 13),
+          axis.text = element_text(size = 16.5),
+          axis.title = element_text(size = 16.5),
+          legend.key = element_blank(),
+          legend.position = "none")
+})
+# Build the shared legend from a plot that contains every Order level.
+# ggarrange(common.legend = TRUE) takes the legend from the first panel; with
+# drop = FALSE that keeps labels but not keys for Orders absent from V4.
+leg_df <- data.frame(PCoA1 = 0, PCoA2 = 0,
+                     Order = factor(ord_present, levels = ord_present))
+leg_p <- ggplot(leg_df, aes(PCoA1, PCoA2, colour = Order)) +
+  geom_point(shape = 16, size = 2.55, alpha = 0.7) +
+  scale_colour_manual(values = mix_col, breaks = ord_present, drop = FALSE,
+                      name = "Host Order") +
+  guides(colour = guide_legend(
+    ncol = 2, byrow = FALSE,
+    override.aes = list(shape = 16, size = 2.55, alpha = 0.7))) +
+  theme_void(base_size = 11) +
+  theme(legend.position = "right",
+        legend.title = element_text(size = 11),
+        legend.text = element_text(size = 11))
+leg <- cowplot::get_legend(leg_p)
+
+p <- ggpubr::ggarrange(plotlist = pcoa_panels, ncol = 3,
+                       common.legend = FALSE, align = "h",
+                       legend.grob = leg, legend = "right")
+save_fig(p, CHAPTER, "Fig_2_mixed_pool_pcoa", 483, 136.8)
+embed_fig(CHAPTER, "Fig_2_mixed_pool_pcoa")
+```
+
+```{r log}
+write_log(CHAPTER, "ch2_summary", c(
+  sprintf("Part A units: %d; samples: %d", nrow(A$units),
+          nrow(A$samples)),
+  sprintf("alpha meta: %s", paste(capture.output(print(A$meta_icc)),
+                                   collapse = " | ")),
+  sprintf("beta meta: %s", paste(capture.output(print(A$meta_beta)),
+                                  collapse = " | ")),
+  "adonis permutations: 1999; mixed-pool adonis: 1999 on server, 200 cores; Mantel: 9999"
+))
+cat("Chapter 2 finished\n")
+```
