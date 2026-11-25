@@ -2,7 +2,7 @@ cff-version: 1.2.0
 message: "Please cite this software archive, the companion dataset, and the associated paper."
 type: software
 title: "Host-associated community structure and microbial host breadth in the seed microbiome: analysis code"
-version: "2.0.0"
+version: "2.0.1"
 license: MIT
 authors:
   - family-names: "Wang"

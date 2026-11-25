@@ -1,7 +1,7 @@
 {
   "title": "Host-associated community structure and microbial host breadth in the seed microbiome: analysis code",
   "upload_type": "software",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Downstream analysis code for the revised global seed microbiome meta-analysis of 6,349 marker-gene samples (4,012 16S and 2,337 ITS) from 122 host genera across 45 countries. The workflow starts from processed tables and uses archived computations and figure assets supplied with the companion dataset. The code and data support reconstruction of the analysis outputs, including host identity and phylogeny, microbial host breadth, and associations with predicted traits and gene functions.",
   "creators": [
     {
